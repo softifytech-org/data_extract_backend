@@ -49,6 +49,23 @@ def _valid_name(value: str) -> bool:
     return len(parts) >= 2 and all(p.isalpha() and len(p) >= 2 for p in parts)
 
 
+def _valid_two_word_name(value: str) -> bool:
+    # shipper_name/stm_name specifically: measured against 250 held-out
+    # records (round 7), word count is a strong discriminator ONLY for
+    # these two fields - false-accept rate climbs from 18.7% (2 words) to
+    # 56.2% (3 words) to 88.9% (4 words) for shipper_name, and 41.0% to
+    # 92.3% to 100.0% for stm_name, because their dominant extraction error
+    # is an adjacent field's leftover word getting glued onto the front of
+    # an otherwise-correct 2-word name (e.g. "Matschek Fredrick Beckman"
+    # instead of "Fredrick Beckman"). The same word-count split shows NO
+    # such relationship for customer_name/billing_name/name_p_holder (FAR
+    # stays ~27-42% regardless of word count there), so this stricter rule
+    # is intentionally scoped to just these two fields rather than folded
+    # into the shared _valid_name used by the others.
+    parts = value.split()
+    return len(parts) == 2 and all(p.isalpha() and len(p) >= 2 for p in parts)
+
+
 def _valid_street_address(value: str) -> bool:
     return bool(re.match(r"^\d{1,6}\s+\S", value)) and len(value) >= 6
 
@@ -160,7 +177,7 @@ FIELD_VALIDATORS: dict[str, callable] = {
     "weight": _valid_weight,
     "blood_group": _valid_blood_group,
     "billing_name": _valid_name,
-    "shipper_name": _valid_name,
+    "shipper_name": _valid_two_word_name,
     "city_2": _valid_city,
     "state_2": _valid_state,
     "zip_2": _valid_zip,
@@ -179,7 +196,7 @@ FIELD_VALIDATORS: dict[str, callable] = {
     "d_b_life_assure": _valid_source_date,
     "p_inst": _valid_currency,
     "name_p_holder": _valid_name,
-    "stm_name": _valid_name,  # BN_Workflow.pdf rule 31: letters + dot only, no "_"/"-"
+    "stm_name": _valid_two_word_name,  # BN_Workflow.pdf rule 31: letters + dot only, no "_"/"-"
     "stm_code": lambda v: len(v) >= 3,
     "dob": _valid_source_date,
     "sex_2": _valid_gender,

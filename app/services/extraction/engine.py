@@ -1199,6 +1199,8 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             pool.sort(key=lambda w: abs(w.y - ref_y))
         return pool[0], pool[0].text
 
+    _TRAILING_GLUED_SUFFIX = re.compile(r"[.,=_-]{1,3}\d{2,6}")
+
     @staticmethod
     def _extract_hash_codes(
         text: str, spans, consumed: set[int]
@@ -1216,9 +1218,24 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             # loosen the shared regex itself.
             if not any(ch.isdigit() for ch in m.group(0)):
                 continue
-            mw = [w for w in words_in_span(spans, m.start(), m.end()) if id(w) not in consumed]
+            end = m.end()
+            # Verified against 6 dev-set examples (e.g. "BaX_01acM" next to
+            # ",--5168", ground truth "BaX_01acM,--5168"): the regex's own
+            # character classes correctly stop at a punctuation mark they
+            # can't continue through, but when that punctuation is
+            # immediately followed by more digits with NO space in the
+            # reconstructed text, it's still the same OCR word (a real word
+            # gap always inserts a space - see parser.build_indexed_text),
+            # so it's the same code, not unrelated adjacent text. This never
+            # crosses an actual word boundary, unlike an earlier cross-word
+            # continuation attempt that was reverted for gluing on unrelated
+            # separate words (e.g. a following "N.A").
+            glued = RuleBasedExtractionEngine._TRAILING_GLUED_SUFFIX.match(text, end)
+            if glued:
+                end = glued.end()
+            mw = [w for w in words_in_span(spans, m.start(), end) if id(w) not in consumed]
             if mw:
-                found.append((m.start(), mw, m.group(0)))
+                found.append((m.start(), mw, text[m.start():end]))
         found.sort(key=lambda item: item[0])
         results = []
         for _, mw, value in found[:2]:
@@ -1249,6 +1266,16 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 next_char = value[len(prefix)]
                 if next_char in "1Il":
                     value = value[: len(prefix)] + "i" + value[len(prefix) + 1 :]
+            # Verified against the dev-set ground truth: every "liB_" STM
+            # Code prefix instance found so far (6/6) has a digit "0"
+            # immediately after it, while OCR reads a letter "O" - the same
+            # constant-prefix digit-confusable pattern as FR-DLI09_ above,
+            # restricted the same way to this exact template position only.
+            lib_prefix = "LIB_"
+            if value.upper().startswith(lib_prefix) and len(value) > len(lib_prefix):
+                next_char = value[len(lib_prefix)]
+                if next_char in "oO":
+                    value = value[: len(lib_prefix)] + "0" + value[len(lib_prefix) + 1 :]
             results.append((mw, value))
         return results
 
