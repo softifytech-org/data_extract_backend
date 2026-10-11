@@ -772,6 +772,34 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 same_line_after.sort(key=lambda item: item[1][0].x)
                 m, mw = same_line_after[0]
                 return mw, m.group(0), m.group(0)
+            # Verified against record 241023 (dev set): State_2 ("MN") and
+            # its own Zip_2 ("56662") sometimes wrap across the line
+            # break, the same way City_2 itself does - Zip starts the
+            # line directly below State with no same-line candidate at
+            # all. Checked before the Y-distance fallback below (not
+            # instead of it) since it's a more precise, position-based
+            # signal than pure nearest-by-Y-distance, which previously
+            # picked an unrelated same-length number from a different
+            # line instead (here, a street address's leading "10333").
+            # Restricted to genuine 5-digit zips and to being the
+            # leftmost word on that line, matching how a wrapped value
+            # naturally starts a fresh line in this form's column grid.
+            next_line = [
+                (m, mw)
+                for m, mw in candidates_found
+                if mw[0].line_num == state_word.line_num + 1
+                and len(m.group(0).split("-")[0]) == 5
+            ]
+            if next_line:
+                next_line.sort(key=lambda item: item[1][0].x)
+                m, mw = next_line[0]
+                # Only accept if this candidate is genuinely the leftmost
+                # word on its line (not just leftmost among zip
+                # candidates), confirming it starts the wrapped line
+                # rather than sitting mid-row as an unrelated number.
+                all_words_on_line = [w for _, _, w in spans if w.line_num == mw[0].line_num]
+                if all_words_on_line and min(all_words_on_line, key=lambda w: w.x).x == mw[0].x:
+                    return mw, m.group(0), m.group(0)
             # No precisely-anchored candidate on State's own line - fall
             # back to nearest-by-Y-distance, but restrict it to genuine
             # 5-digit zips only. Verified against real ground-truth data
