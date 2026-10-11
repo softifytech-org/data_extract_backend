@@ -532,6 +532,19 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             # vocabulary (same technique already used for day-names glued
             # onto hash codes) - stripping a trailing match is safe and
             # unambiguous.
+            # Verified against records 241030/241036 (dev set): PhNo_2's
+            # own explicit "N.A" sometimes glues directly onto the FRONT
+            # of Card Name with no real gap ("N.A American Express",
+            # "N,.A American Express" with OCR's stray comma) - the
+            # 3-word fuzzy window still clears the match cutoff against
+            # "AMERICAN EXPRESS" since it's a near-total substring, so the
+            # raw joined text (including the glued prefix) gets stored
+            # as-is. A loose N.A-shaped prefix (tolerating the OCR comma
+            # noise already seen elsewhere, e.g. field_validation.py's own
+            # handling of "N,.A") is a small, closed shape - stripping it
+            # is as safe and unambiguous as the existing trailing-strip
+            # cases below.
+            value = re.sub(r"^N[.,]+A\.?,?\s+", "", value, flags=re.IGNORECASE)
             upper = value.upper()
             stripped_drug = None
             for drug in pat.DRUG_NAMES:
