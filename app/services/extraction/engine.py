@@ -1249,6 +1249,19 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         return pool[0], pool[0].text
 
     _TRAILING_GLUED_SUFFIX = re.compile(r"[.,=_-]{1,3}\d{2,6}")
+    # Cross-word bridge: a genuinely separate OCR word that is PURELY
+    # separator characters (no letters, no digits - e.g. "=-", "--", ",--")
+    # directly between the code and a trailing pure-digit word (e.g.
+    # "BaX_01aCm" + "=-" + "83454", three separate OCR tokens with real
+    # word gaps - confirmed via record 241054, 09106.jpeg - every word
+    # gap in the reconstructed text is exactly one space, see
+    # parser.build_indexed_text). Deliberately narrower than an earlier
+    # general-purpose cross-word continuation attempt that was reverted
+    # for gluing onto unrelated words (a following "N.A", a bare
+    # adjacent "10"): this only bridges when the CONNECTING word has no
+    # letters or digits at all, which "N.A" and a bare number never
+    # satisfy, so it cannot reproduce that regression.
+    _CROSS_WORD_BRIDGE = re.compile(r" [.,=_-]{1,3} \d{2,6}\b")
 
     @staticmethod
     def _extract_hash_codes(
@@ -1300,6 +1313,10 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             glued = RuleBasedExtractionEngine._TRAILING_GLUED_SUFFIX.match(text, end)
             if glued:
                 end = glued.end()
+            else:
+                bridge = RuleBasedExtractionEngine._CROSS_WORD_BRIDGE.match(text, end)
+                if bridge:
+                    end = bridge.end()
             mw = [w for w in words_in_span(spans, m.start(), end) if id(w) not in consumed]
             if mw:
                 found.append((m.start(), mw, text[m.start():end]))
