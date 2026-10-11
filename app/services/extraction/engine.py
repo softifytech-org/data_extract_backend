@@ -1021,43 +1021,74 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         if record_no_pos is not None:
             found = [item for item in found if item[0] >= record_no_pos]
 
-        # Order of appearance, not grammar, decides D_Birth vs DOB - the
-        # legacy form's field order (D_Birth early, DOB late) matches which
-        # date appears first/last in the source text more reliably than
-        # trying to infer meaning from date *format* (both grammars appear
-        # for either field across different document families). FIRST and
-        # LAST (not first+second): some records carry an extra date in
-        # between that isn't part of this schema at all (e.g. a transaction
-        # date) - taking the two ends is robust to that regardless of how
-        # many extra dates land in the middle.
-        if found:
-            _, mw, raw_date = found[0]
-            for w in mw:
-                consumed.add(id(w))
-            candidates["d_birth"] = FieldCandidate(
-                "d_birth", raw_date, raw_date, average_confidence(mw), bounding_box_for_words(mw), True
-            )
-        if len(found) > 1:
-            _, mw, raw_date = found[-1]
-            for w in mw:
-                consumed.add(id(w))
-            candidates["dob"] = FieldCandidate(
-                "dob", raw_date, raw_date, average_confidence(mw), bounding_box_for_words(mw), True
-            )
-        # D_B_Life_Assure is also a date field (confirmed against
-        # BN_WorkFlow.pdf's field spec - it sits between D_Birth and DOB on
-        # the legacy form, not a currency amount as previously assumed). It
-        # is exactly the "extra middle date" the note above describes - use
-        # it instead of discarding it, but only when a genuine 3rd date
-        # exists; with only 2 dates found there's nothing reliable to give
-        # it, so it's correctly left unmatched rather than guessed.
-        if len(found) > 2:
-            _, mw, raw_date = found[1]
-            for w in mw:
-                consumed.add(id(w))
-            candidates["d_b_life_assure"] = FieldCandidate(
-                "d_b_life_assure", raw_date, raw_date, average_confidence(mw), bounding_box_for_words(mw), True
-            )
+        # Verified by scanning the FULL real ground-truth XML directly (not
+        # a sample): D_Birth, DOB, and D_B_Life_Assure are the SAME
+        # underlying date, printed 2-3 times on the form (D_Birth == DOB in
+        # 95.1% of all 3597 records; all three match in 93.2% of records
+        # that have D_B_Life_Assure) - the exact same "duplicated field"
+        # pattern already known for Customer Name/Billing Name/
+        # Name_P_Holder, not three distinct, sequentially-positioned dates.
+        # The previous "first/middle/last position" assumption meant
+        # D_B_Life_Assure (and sometimes DOB) only got a value when 3+
+        # separate date matches happened to be found in this one OCR pass -
+        # missing them whenever OCR read fewer occurrences, even though the
+        # real shared value was available from a different, successfully-
+        # read occurrence in the same record. Groups matches by their
+        # numeric date (day-name spelling/garbling ignored for grouping
+        # only, never for the stored value) and assigns whichever
+        # repeated-occurrence reading is most complete to all three.
+        def date_key(raw: str) -> str:
+            m = re.search(r"\d{1,2}/\d{1,2}/\d{4}", raw)
+            return m.group(0) if m else raw.upper()
+
+        date_keys = [date_key(raw) for _, _, raw in found]
+        key_counts: dict[str, int] = {}
+        for k in date_keys:
+            key_counts[k] = key_counts.get(k, 0) + 1
+        most_common_key = max(key_counts, key=lambda k: key_counts[k]) if key_counts else None
+
+        if most_common_key is not None and key_counts[most_common_key] >= 2:
+            group = [i for i, k in enumerate(date_keys) if k == most_common_key]
+            best_idx = max(group, key=lambda i: len(found[i][2]))
+            _, best_mw, shared_value = found[best_idx]
+            for i in group:
+                for w in found[i][1]:
+                    consumed.add(id(w))
+            conf = average_confidence(best_mw)
+            bbox = bounding_box_for_words(best_mw)
+            for field_name in ("d_birth", "dob", "d_b_life_assure"):
+                candidates[field_name] = FieldCandidate(
+                    field_name, shared_value, shared_value, conf, bbox, True
+                )
+        else:
+            # No repeat evidenced in this pass (0 or 1 date found, or
+            # several genuinely distinct ones) - fall back to the prior
+            # positional heuristic rather than guess at a duplication this
+            # pass gives no evidence for. Order of appearance decides
+            # D_Birth vs DOB; taking the two ends (not first+second) stays
+            # robust to an unrelated extra date (e.g. a transaction date)
+            # landing in the middle.
+            if found:
+                _, mw, raw_date = found[0]
+                for w in mw:
+                    consumed.add(id(w))
+                candidates["d_birth"] = FieldCandidate(
+                    "d_birth", raw_date, raw_date, average_confidence(mw), bounding_box_for_words(mw), True
+                )
+            if len(found) > 1:
+                _, mw, raw_date = found[-1]
+                for w in mw:
+                    consumed.add(id(w))
+                candidates["dob"] = FieldCandidate(
+                    "dob", raw_date, raw_date, average_confidence(mw), bounding_box_for_words(mw), True
+                )
+            if len(found) > 2:
+                _, mw, raw_date = found[1]
+                for w in mw:
+                    consumed.add(id(w))
+                candidates["d_b_life_assure"] = FieldCandidate(
+                    "d_b_life_assure", raw_date, raw_date, average_confidence(mw), bounding_box_for_words(mw), True
+                )
         return [item[0] for item in found]
 
     @staticmethod
