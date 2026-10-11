@@ -1261,7 +1261,16 @@ class RuleBasedExtractionEngine(ExtractionEngine):
     # adjacent "10"): this only bridges when the CONNECTING word has no
     # letters or digits at all, which "N.A" and a bare number never
     # satisfy, so it cannot reproduce that regression.
-    _CROSS_WORD_BRIDGE = re.compile(r" [.,=_-]{1,3} \d{2,6}\b")
+    # Verified against record 241036 (dev set): "BaX_01acM, -- 5168" has
+    # a dangling comma attached to the CODE's own word (no space before
+    # it - the regex's own trailing \b requirement stops the base match
+    # right before it, same mechanism as _TRAILING_GLUED_SUFFIX above),
+    # THEN a genuine word gap, then the separator-only word, then
+    # another gap, then the digit word - a 4-part shape the plain
+    # single-space version above didn't anticipate. The optional leading
+    # [.,=_-]{0,2} consumes that dangling same-word punctuation before
+    # the cross-word part starts.
+    _CROSS_WORD_BRIDGE = re.compile(r"[.,=_-]{0,2} [.,=_-]{1,3} \d{2,6}\b")
 
     @staticmethod
     def _extract_hash_codes(
