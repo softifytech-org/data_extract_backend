@@ -1673,9 +1673,24 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 for w in words
                 if id(w) not in consumed
                 and anchor < (w.line_num, w.x) < right_boundary
-                and re.fullmatch(r"[A-Za-z][A-Za-z_.]+", w.text)
+                # Verified against record 241018 (dev set): "Bruce D
+                # Mcdonald" - a bare single-letter middle initial with no
+                # period, a confirmed real name shape in this dataset
+                # (First MiddleInitial Last, no punctuation) - was
+                # invisible to this filter two ways at once: the regex
+                # required 2+ characters, and a lone capital letter
+                # trivially satisfies isupper() the same way an ALL-CAPS
+                # noise word like "WINSLOW" does, even though the isupper
+                # check exists to exclude THOSE, not initials. With "D"
+                # excluded, the gap measurement jumped straight from
+                # "Bruce" to "Mcdonald", exceeding the contiguous-run
+                # threshold and breaking the name in two. Both relaxed:
+                # a single character is now a valid candidate, and the
+                # ALL-CAPS exclusion only applies to words long enough to
+                # actually be place-name noise.
+                and re.fullmatch(r"[A-Za-z][A-Za-z_.]*", w.text)
                 and w.text.upper() not in NOISE_TOKENS
-                and not w.text.isupper()
+                and not (len(w.text) >= 2 and w.text.isupper())
                 and w.text.lower() not in dup_name_tokens
             ]
             shipper_tokens = self._trailing_contiguous_run(candidates_ship)
