@@ -778,8 +778,19 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 return None
             state_y = state_word.y
             candidates_found.sort(key=lambda item: abs((item[1][0].y if item[1] else 0) - state_y))
-        m, mw = candidates_found[0]
-        return mw, m.group(0), m.group(0)
+            m, mw = candidates_found[0]
+            return mw, m.group(0), m.group(0)
+        # Verified against real ground-truth data (record 241016): with no
+        # state anchor at all, this returned the FIRST zip-shaped (3-5
+        # digit) token found anywhere in the record's text, in plain
+        # reading order - no position check of any kind. That's the res
+        # address's own house number far more often than it's a real zip,
+        # since the address is read before city/state/zip in this form's
+        # layout. No anchor means no reliable way to find zip at all here;
+        # returning nothing is safer than confidently claiming the wrong
+        # field's value; also stops zip_2 from stealing a word that
+        # res_address would otherwise correctly claim later.
+        return None
 
     @staticmethod
     def _extract_phones(
