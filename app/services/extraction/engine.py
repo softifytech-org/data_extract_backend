@@ -317,7 +317,13 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             w, value, sugg = genders[0]
             claim("sex_1", [w], value, value, note=suggestion_note(sugg))
         if len(genders) > 1:
-            w, value, sugg = genders[1]
+            # Verified against real ground-truth data: a third gender-shaped
+            # token sometimes appears between Sex_1 and the real Sex_2
+            # (same "extra occurrence in the middle" pattern already
+            # confirmed for dates) - taking the LAST match rather than the
+            # second keeps this robust to it, and is identical to the
+            # second match whenever exactly 2 are found (the common case).
+            w, value, sugg = genders[-1]
             claim("sex_2", [w], value, value, note=suggestion_note(sugg))
 
         # --- country x2 ---
@@ -519,6 +525,18 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         card_match = self._match_multiword_enum(words, consumed, pat.CARD_TYPES, max_window=3)
         if card_match:
             mw, value, sugg = card_match
+            # Verified against real ground-truth data: the following
+            # Medicine value is sometimes glued directly onto Card Name
+            # with no space in the source ("American ExpressXANAX" instead
+            # of "American Express"). Drug names are a small closed
+            # vocabulary (same technique already used for day-names glued
+            # onto hash codes) - stripping a trailing match is safe and
+            # unambiguous.
+            upper = value.upper()
+            for drug in pat.DRUG_NAMES:
+                if upper.endswith(drug) and len(value) > len(drug):
+                    value = value[: -len(drug)].rstrip()
+                    break
             claim("card_name", mw, value, value, note=suggestion_note(sugg))
 
         # --- medicine (drug name vocabulary) ---
