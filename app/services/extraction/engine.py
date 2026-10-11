@@ -1696,10 +1696,17 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 # threshold and breaking the name in two. Both relaxed:
                 # a single character is now a valid candidate, and the
                 # ALL-CAPS exclusion only applies to words long enough to
-                # actually be place-name noise.
+                # actually be place-name noise. Counting ALPHABETIC
+                # characters specifically, not raw length, for that last
+                # check: a period-punctuated initial like "B." has
+                # len()==2 but only one real letter, and
+                # "B.".isupper()==True (Python ignores the non-cased
+                # period) - the original len>=2 guard still wrongly
+                # excluded this shape (confirmed via "Claude B. Vicars",
+                # record 241017, dev set).
                 and re.fullmatch(r"[A-Za-z][A-Za-z_.]*", w.text)
                 and w.text.upper() not in NOISE_TOKENS
-                and not (len(w.text) >= 2 and w.text.isupper())
+                and not (sum(ch.isalpha() for ch in w.text) >= 2 and w.text.isupper())
                 and w.text.lower() not in dup_name_tokens
             ]
             shipper_tokens = self._trailing_contiguous_run(candidates_ship)
