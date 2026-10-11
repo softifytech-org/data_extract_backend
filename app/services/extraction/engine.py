@@ -1436,7 +1436,19 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             if len(t) < 2 or t.upper() in NOISE_TOKENS:
                 return False
             if allow_alnum:
-                return t.isalnum() and not t.isdigit() and t[0].isalpha()
+                # Verified against record 241034 (dev set): a real,
+                # genuinely-repeated customer name containing a period
+                # ("Eric.Satterly", the same real name shape already
+                # confirmed elsewhere in this document family - e.g.
+                # "Thomas.Rimmler", "H.Garland") failed isalnum() outright
+                # (a period isn't alphanumeric), so EVERY occurrence of
+                # that name silently never formed a word-like run at all -
+                # the repeat-detection below never saw it as a candidate,
+                # and a different, unrelated, non-repeating run won by
+                # default instead. Matches the same allowed-character set
+                # already used by the shipper_name candidate regex
+                # elsewhere in this file ([A-Za-z][A-Za-z_.]+).
+                return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_.]*", t))
             return t.isalpha()
 
         # Collect every same-line run of 2-4 consecutive word-like tokens,
