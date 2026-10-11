@@ -23,6 +23,35 @@ from pathlib import Path
 
 _CONFIG_PATH = Path(__file__).parent / "field_reliability_thresholds.json"
 
+# Fields whose measured false-acceptance rate (of values currently marked
+# VERIFIED that are actually wrong) exceeded the agreed 5% safety limit by a
+# wide margin on held-out data, even though their raw score already clears
+# the global confidence bar - meaning the score does not reliably predict
+# correctness for these fields (see PHASE5_FINAL_REPORT.md: stm_name 38-55%
+# FAR, shipper_name 17-43%, stm_code 30-36%, customer_name/billing_name/
+# name_p_holder 25-32%, res_address 22-24%, email_address 13-16%, zip_2 12-
+# 15%). remark is included unconditionally: it is derived from the other 43
+# fields' own validation status and has no independent confidence signal of
+# its own. Routed to mandatory review regardless of score - raising the
+# threshold further does not help when a wrong value already clears it most
+# of the time (see services/validation/confidence.py's ocr_agreement
+# component, which is architecturally maxed for any single-OCR-pass source
+# and so cannot discriminate correct from incorrect here). Only add a field
+# here backed by a measured FAR run, never a guess - the whole point of this
+# list is to stop pretending the score means something it doesn't.
+ALWAYS_REVIEW_FIELDS: frozenset[str] = frozenset({
+    "remark",
+    "stm_name",
+    "shipper_name",
+    "stm_code",
+    "customer_name",
+    "billing_name",
+    "name_p_holder",
+    "res_address",
+    "email_address",
+    "zip_2",
+})
+
 
 def load_thresholds() -> dict[str, float]:
     """field_name -> confidence score (0-100) required for auto-accept.

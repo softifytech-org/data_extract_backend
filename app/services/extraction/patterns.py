@@ -193,7 +193,7 @@ CARD_TYPES = {
 # characters, which is the whole point of enum-style validation.
 DRUG_NAMES = {
     "XANAX", "VALIUM", "ZOLOFT", "PHENTERMINE", "AMBIEN", "DIAZEPAM", "ADIPEX",
-    "LORAZEPAM", "CLONAZAPAM", "DIDREX",
+    "LORAZEPAM", "CLONAZAPAM", "CLONAZEPAM", "DIDREX",
 }
 
 COUNTRY_VALUES = {"US", "USA"}

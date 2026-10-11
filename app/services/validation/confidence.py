@@ -74,6 +74,18 @@ def field_status_for_score(
 ) -> FieldStatus:
     if not has_value:
         return FieldStatus.NEEDS_REVIEW
+    if field_name is not None:
+        from app.core.config import get_settings
+
+        settings = get_settings()
+        if settings.review_tiers_enabled:
+            from app.services.validation.field_reliability import ALWAYS_REVIEW_FIELDS
+
+            if field_name in ALWAYS_REVIEW_FIELDS:
+                # Measured false-acceptance rate too high to trust the score
+                # alone for this field (see ALWAYS_REVIEW_FIELDS) - mandatory
+                # review regardless of how high the score reads.
+                return FieldStatus.NEEDS_REVIEW
     # A field with a calibrated, measured-reliable threshold (see
     # services/validation/field_reliability.py) can auto-accept at a lower
     # confidence score than the global default - but only once real

@@ -57,6 +57,16 @@ class Settings(BaseSettings):
     # Off by default so that cost is opt-in, not silently imposed.
     paddleocr_enabled: bool = False
 
+    # Per-field review tiers (services/validation/field_reliability.py):
+    # routes fields with a measured false-acceptance rate above the agreed
+    # safety limit to mandatory review regardless of confidence score, and
+    # lets fields proven safe at a lower score (via held-out measurement,
+    # never a guess) auto-accept sooner. On by default since both lists are
+    # populated only from measured benchmark data; set false to fall back
+    # to the single global confidence_high_threshold for every field, e.g.
+    # to isolate whether a regression is tier-related during debugging.
+    review_tiers_enabled: bool = True
+
     @property
     def allowed_extensions_set(self) -> set[str]:
         return {ext.strip().lower() for ext in self.allowed_extensions.split(",") if ext.strip()}

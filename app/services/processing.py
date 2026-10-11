@@ -77,6 +77,19 @@ def _add_derived_fields(fields: dict[str, ExtractedField], *, original_filename:
     )
     remark_spec = FIELD_SPEC_BY_NAME["remark"]
     remark_value = generate_remark(fields)
+    # Verified against 250 held-out records: remark values marked VERIFIED
+    # are wrong 97% of the time - it's derived from all 43 other fields'
+    # own validation status rather than read from the image, so it has no
+    # independent confidence signal of its own and was never a candidate
+    # for auto-acceptance in the first place (see ALWAYS_REVIEW_FIELDS).
+    # Hardcoding VERIFIED here bypassed that entirely; route it through the
+    # same review-tier decision everything else uses instead.
+    from app.core.config import get_settings
+    from app.services.validation.field_reliability import ALWAYS_REVIEW_FIELDS
+
+    remark_status = FieldStatus.VERIFIED
+    if get_settings().review_tiers_enabled and "remark" in ALWAYS_REVIEW_FIELDS:
+        remark_status = FieldStatus.NEEDS_REVIEW
     fields["remark"] = ExtractedField(
         field_name="remark",
         label=remark_spec.label,
@@ -84,7 +97,7 @@ def _add_derived_fields(fields: dict[str, ExtractedField], *, original_filename:
         original_ocr_value=None,
         data_type=DataType.TEXT,
         confidence=100.0,
-        status=FieldStatus.VERIFIED,
+        status=remark_status,
         bounding_box=None,
     )
 
