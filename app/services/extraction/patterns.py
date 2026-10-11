@@ -155,6 +155,11 @@ US_STATE_ABBREVIATIONS = {
     "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV",
     "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN",
     "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", "DC",
+    # USPS territory/military codes, confirmed by a full ground-truth scan
+    # (3597 records): PR (283 occurrences across State_1/State_2), AE (37),
+    # AP (16), VI (6), AA (5) - all real, standard USPS abbreviations this
+    # vocabulary was simply missing, not an edge case.
+    "PR", "VI", "AE", "AP", "AA",
 }
 
 GENDER_VALUES = {"MALE", "FEMALE"}
