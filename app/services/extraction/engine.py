@@ -1029,6 +1029,40 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             if normalize_date_numeric(*m.groups()) is not None:
                 raw = re.sub(r"\s+", " ", m.group(0)).strip()
                 found.append((m.start(), mw, raw))
+
+        # Recovery pass: verified against 5 dev-set examples, DOB sometimes
+        # glues directly onto a following STM_Code/Policy_No hash-code with
+        # no separator (e.g. "BaX_01acM_9548" + "11/23/1952" read as
+        # "...954811/23/1952") - the date regex's leading \b can't match
+        # mid-digit-run there, so the normal DATE_NUMERIC pass above misses
+        # it entirely. Reuses the hash-code shape (not a blanket
+        # unanchored date search) to find exactly where such a code would
+        # overshoot into a trailing date, matching the same overshoot
+        # _extract_hash_codes trims on its own independent pass later -
+        # every traced example overshoots by exactly the date's 2-digit
+        # day field.
+        # Words recovered this way physically overlap a hash-code match
+        # (the two values are glued onto the SAME OCR word) - consumption is
+        # tracked per word, not per character range, so these words must
+        # NOT be marked consumed here, or _extract_hash_codes (which runs
+        # later and needs that same word for stm_code/policy_no) would find
+        # nothing left to claim.
+        glued_recovery_word_ids: set[int] = set()
+        for hm in HASH_CODE.finditer(text):
+            if not any(ch.isdigit() for ch in hm.group(0)):
+                continue
+            for overshoot in (2, 1):
+                trial_end = hm.end() - overshoot
+                if trial_end <= hm.start():
+                    continue
+                dm = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})\b", text[trial_end:])
+                if dm and normalize_date_numeric(*dm.groups()) is not None:
+                    mw = [w for w in words_in_span(spans, trial_end, trial_end + dm.end()) if id(w) not in consumed]
+                    if mw:
+                        glued_recovery_word_ids.update(id(w) for w in mw)
+                        found.append((trial_end, mw, dm.group(0)))
+                    break
+
         found.sort(key=lambda item: item[0])
 
         # A date whose text position comes BEFORE this record's own Record
@@ -1071,7 +1105,8 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             _, best_mw, shared_value = found[best_idx]
             for i in group:
                 for w in found[i][1]:
-                    consumed.add(id(w))
+                    if id(w) not in glued_recovery_word_ids:
+                        consumed.add(id(w))
             conf = average_confidence(best_mw)
             bbox = bounding_box_for_words(best_mw)
             for field_name in ("d_birth", "dob", "d_b_life_assure"):
@@ -1089,21 +1124,24 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             if found:
                 _, mw, raw_date = found[0]
                 for w in mw:
-                    consumed.add(id(w))
+                    if id(w) not in glued_recovery_word_ids:
+                        consumed.add(id(w))
                 candidates["d_birth"] = FieldCandidate(
                     "d_birth", raw_date, raw_date, average_confidence(mw), bounding_box_for_words(mw), True
                 )
             if len(found) > 1:
                 _, mw, raw_date = found[-1]
                 for w in mw:
-                    consumed.add(id(w))
+                    if id(w) not in glued_recovery_word_ids:
+                        consumed.add(id(w))
                 candidates["dob"] = FieldCandidate(
                     "dob", raw_date, raw_date, average_confidence(mw), bounding_box_for_words(mw), True
                 )
             if len(found) > 2:
                 _, mw, raw_date = found[1]
                 for w in mw:
-                    consumed.add(id(w))
+                    if id(w) not in glued_recovery_word_ids:
+                        consumed.add(id(w))
                 candidates["d_b_life_assure"] = FieldCandidate(
                     "d_b_life_assure", raw_date, raw_date, average_confidence(mw), bounding_box_for_words(mw), True
                 )
@@ -1219,6 +1257,24 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             if not any(ch.isdigit() for ch in m.group(0)):
                 continue
             end = m.end()
+            # Verified against 5 dev-set examples (e.g. "BaX_01acM_9548" +
+            # "11/23/1952" glued with no separator at all, read as
+            # "BaX_01acM-954811/23/1952"): when DOB's date is glued directly
+            # onto this code, the code's character class has nothing to
+            # distinguish "its own trailing digits" from "the date's
+            # leading digits" and overshoots into the date - every traced
+            # example overshoots by exactly the date's 2-digit day field.
+            # Trim back 1-2 digits whenever doing so reveals a complete
+            # DD/MM/YYYY date starting immediately after - the matching
+            # recovery of that date into _extract_dates is what actually
+            # lets DOB be found (its own regex can't match mid-digit-run).
+            for overshoot in (2, 1):
+                trial_end = end - overshoot
+                if trial_end <= m.start():
+                    continue
+                if re.match(r"\d{1,2}/\d{1,2}/\d{4}\b", text[trial_end:]):
+                    end = trial_end
+                    break
             # Verified against 6 dev-set examples (e.g. "BaX_01acM" next to
             # ",--5168", ground truth "BaX_01acM,--5168"): the regex's own
             # character classes correctly stop at a punctuation mark they
