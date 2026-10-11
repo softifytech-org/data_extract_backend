@@ -1749,7 +1749,18 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 claim("stm_name", stm_tokens, stm_value, stm_value)
                 return
 
-        secondary = self._find_name_run(words, consumed, allow_alnum=False)
+        # Verified against record 241044 (dev set): with no stm_code
+        # anchor to search against, this fallback re-runs the same
+        # repeat-detection used for the primary name from scratch - with
+        # no awareness that the primary name's own duplicate-printed
+        # occurrence is still sitting unconsumed elsewhere (only the ONE
+        # occurrence actually claimed by customer_name gets consumed), so
+        # it re-discovers the already-claimed name as "repeated" again
+        # and wrongly assigns it to stm_name too. Excluding the known
+        # duplicate name's own tokens here, the same way the stm_code-
+        # anchored path above already does.
+        secondary_words = [w for w in words if w.text.lower() not in dup_name_tokens]
+        secondary = self._find_name_run(secondary_words, consumed, allow_alnum=False)
         if secondary:
             mw2, value2, repeated2 = secondary
             conf2 = min(100.0, average_confidence(mw2) * 1.3) if repeated2 else None
