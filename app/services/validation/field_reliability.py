@@ -39,6 +39,13 @@ _CONFIG_PATH = Path(__file__).parent / "field_reliability_thresholds.json"
 # and so cannot discriminate correct from incorrect here). Only add a field
 # here backed by a measured FAR run, never a guess - the whole point of this
 # list is to stop pretending the score means something it doesn't.
+#
+# policy_no added after a FRESH held-out confirmation (round 8, 25 images
+# never used for tuning) measured 24.5% FAR - well above both the 5% bar
+# and the earlier dev-set-only estimate of 11.8%. Exactly the dev-set-vs-
+# held-out gap this project's discipline exists to catch: a field must not
+# be treated as safe on development-set results alone (see RESULTS_SUMMARY.md
+# round 8).
 ALWAYS_REVIEW_FIELDS: frozenset[str] = frozenset({
     "remark",
     "stm_name",
@@ -50,6 +57,7 @@ ALWAYS_REVIEW_FIELDS: frozenset[str] = frozenset({
     "res_address",
     "email_address",
     "zip_2",
+    "policy_no",
 })
 
 
