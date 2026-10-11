@@ -328,6 +328,30 @@ class RuleBasedExtractionEngine(ExtractionEngine):
 
         # --- country x2 ---
         countries = self._match_all_single_token_enum(words, consumed, pat.COUNTRY_VALUES)
+        # Verified against real ground-truth data (17 occurrences across
+        # the full dump) and record 241054 (dev set) directly: "US" is a
+        # common American highway-naming convention ("US Hwy 19", "US
+        # Route 50") that can appear embedded in Res Address, genuinely
+        # earlier in reading order than the real Country_1 slot. Its
+        # matched VALUE is harmless (it spells "US" either way, so
+        # Country_1/Country_2 still read correctly), but claiming that
+        # WORD consumes it, breaking Res Address's own contiguous-run
+        # walk. Same technique already proven for the state/city "CO
+        # SPGS" collision: a genuine Country slot is never immediately
+        # followed by a highway-designation word on the same line.
+        _HWY_WORDS = {"HWY", "HIGHWAY", "ROUTE", "RTE"}
+        if countries:
+            by_line: dict[int, list] = {}
+            for w in sorted(words, key=lambda w: (w.line_num, w.x)):
+                by_line.setdefault(w.line_num, []).append(w)
+            filtered_countries = []
+            for w, v, s in countries:
+                same_line = by_line.get(w.line_num, [])
+                later = [o for o in same_line if o.x > w.x]
+                if later and later[0].text.upper() in _HWY_WORDS and later[0].x - w.right <= max(w.height, later[0].height) * 4:
+                    continue
+                filtered_countries.append((w, v, s))
+            countries = filtered_countries
         if countries:
             w, value, sugg = countries[0]
             claim("country_1", [w], value, value, note=suggestion_note(sugg))
@@ -664,8 +688,18 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         words: list[OCRWord], consumed: set[int], vocabulary: set[str]
     ) -> list[tuple[OCRWord, str, str | None]]:
         """Like _match_single_token_enum but returns every match, in reading
-        order, and consumes each as it's found. Used for fields that appear
-        twice per record (Sex_1/Sex_2, Country_1/Country_2, ...).
+        order. Used for fields that appear twice per record (Sex_1/Sex_2,
+        Country_1/Country_2, ...).
+
+        Does NOT consume matches itself - callers only claim(), and
+        therefore only consume, the 1-2 entries they actually use (e.g.
+        genders[0]/genders[-1]). Verified against record 241054 (dev set):
+        this used to consume every match found, including ones never
+        claimed by anything - a third "US" embedded in "US Hwy 19" (a
+        common American highway-naming convention, not country data at
+        all) was silently swallowed even though only the first two "US"
+        occurrences became Country_1/Country_2, breaking the res_address
+        gap-walk's contiguous run by removing a word from its middle.
 
         Verified against real ground-truth data that fuzzy matching (cutoff
         0.8) is unsafe for very short vocabularies like the 2-letter US state
@@ -679,7 +713,15 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         short_vocab = max(len(v) for v in vocabulary) <= 3
         vocab_lengths = {len(v) for v in vocabulary}
         found: list[tuple[OCRWord, str, str | None]] = []
-        for w in words:
+        # Verified while fixing the over-consumption issue above: this
+        # never sorted its input, unlike _match_multiword_enum elsewhere
+        # in this file, which explicitly does. Callers rely on "first
+        # match" / "second match" meaning first/second BY POSITION
+        # (Sex_1 before Sex_2, Country_1 before Country_2, ...) - without
+        # this, whatever raw order `words` happens to already be in
+        # decides it instead, which is not guaranteed to be reading
+        # order.
+        for w in sorted(words, key=lambda w: (w.page, w.line_num, w.x)):
             if id(w) in consumed:
                 continue
             if len(w.text) < 2:
@@ -693,7 +735,6 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             if match:
                 suggestion = match if match.upper() != w.text.upper() else None
                 found.append((w, w.text, suggestion))
-                consumed.add(id(w))
         return found
 
     @staticmethod
