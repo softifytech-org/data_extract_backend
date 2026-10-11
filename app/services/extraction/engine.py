@@ -916,6 +916,18 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 break
             contiguous.insert(0, w)
         picked = contiguous[-5:]
+        # Tried: recovering a City_2 that wraps across the line break
+        # itself (e.g. "NEW" on the row above State_2, "HAVEN" starting
+        # State_2's own row - confirmed via records 241066/241096) by
+        # prepending the last ALL-CAPS word of the row above. Reverted:
+        # measured on the dev set, this regressed city_2 (-12.1pp),
+        # shipper_name (-18.1pp), and res_address (-4.0pp) - the row
+        # directly above State_2 is NOT a fixed, reliable column position
+        # across records (it holds Shipper Name's own trailing word in
+        # many records, which this then wrongly stole whenever Shipper
+        # Name's real value happened to be missing/short on that row).
+        # Net regression, not a net improvement - left unfixed pending a
+        # more precise signal than "last word of the previous row".
         return picked, " ".join(w.text for w in picked)
 
     # A real US place name is recognizable even without the ALL CAPS
