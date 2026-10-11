@@ -1456,8 +1456,23 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         for i, w in enumerate(ordered):
             if w.text[:1].isdigit() and len(w.text) <= 6:
                 run = [w]
+                # Verified against record 241064 (dev set): this had no
+                # line or gap boundary at all, just "next 7 unconsumed
+                # words" - with no real street address to find (this
+                # record's res_address is "PO Box 605", which doesn't
+                # start with a digit and so never reaches this fallback;
+                # res_address proper was empty/unfound), it happily
+                # walked straight across line and field boundaries into
+                # height/weight/blood_group ("605 DULLES INTERNATION AL
+                # AIRP 185 170 AB+"). Same contiguous-run discipline used
+                # everywhere else in this file: stop at a line change or
+                # a gap wider than the words' own height.
                 for nxt in ordered[i + 1 : i + 8]:
                     if nxt.text.upper() in NOISE_TOKENS:
+                        break
+                    if nxt.line_num != run[-1].line_num:
+                        break
+                    if nxt.x - run[-1].right > max(nxt.height, run[-1].height) * 0.8:
                         break
                     run.append(nxt)
                 if len(run) >= 3:
