@@ -229,14 +229,18 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 if windowed:
                     words = windowed
 
-        # Split words like "MissoulaOR" into "Missoula" + "OR" - OCR
-        # sometimes glues a city name directly onto the following state
-        # abbreviation with no space. Left unsplit, single-token state
-        # matching can never see the "OR" (the whole glued token is nowhere
-        # close to a 2-letter match) - verified to cause a much worse
-        # cascading failure: State_1 goes unmatched, so the record's OTHER
-        # state occurrence slides up to fill State_1's slot, and City_1/
-        # Zip_1 vs City_2/Zip_2 end up swapped along with it.
+        # Tried disabling this entirely (a full ground-truth scan showed
+        # EVERY state abbreviation collides with common real name endings,
+        # e.g. "OR" with "Metaphor" 127 times) - the dev set showed a big
+        # gain (stm_name/city_2/state_2 all up), but a FRESH held-out batch
+        # showed the opposite: city_1/state_2/res_address all dropped, and
+        # the metric that matters most (records >=40/44) went DOWN
+        # (9.6%->9.2%). That means some held-out records DO have a genuine
+        # glued city+state token after all - the dev-set gain didn't
+        # generalize. Reverted to keep the step enabled, with the three
+        # individually-confirmed exclusions (IA, NE, IN) from direct
+        # mismatch tracing, per "retain changes only when evidence
+        # supports them, measured on held-out data, not the dev set alone."
         words = self._split_glued_state_suffixes(words)
         text, spans = build_indexed_text(words)
 
@@ -363,6 +367,8 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         city1_start_key: tuple[int, int] | None = None
         if state_1_word is not None:
             city1 = self._extract_city(words, consumed, state_1_word)
+            if not city1:
+                city1 = self._extract_city_fallback(words, consumed, state_1_word)
             if city1:
                 mw, value = city1
                 claim("city_1", mw, value, value)
@@ -371,6 +377,8 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         city2_start_key: tuple[int, int] | None = None
         if state_2_word is not None:
             city2 = self._extract_city(words, consumed, state_2_word)
+            if not city2:
+                city2 = self._extract_city_fallback(words, consumed, state_2_word)
             if city2:
                 mw, value = city2
                 claim("city_2", mw, value, value)
@@ -415,6 +423,24 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # fields at once (verified: this was exactly why Alcoholic was
         # coming back "N.A" instead of the flags' own real first answer).
         blood = self._match_single_token_enum(words, consumed, pat.BLOOD_GROUP_VALUES, cutoff=0.6)
+        if not blood:
+            # Verified against real ground-truth data: Azure sometimes
+            # prints the blood-type letter "O" as digit "0" (a classic OCR
+            # confusable) - e.g. raw token "0+" where the real value must
+            # be "O+" (no blood type can contain a literal zero; this is a
+            # closed 8-value vocabulary, so there's no ambiguity about what
+            # "0+"/"0-" actually means). The default fuzzy cutoff (0.6)
+            # doesn't catch this specific single-character substitution, so
+            # it's checked directly rather than loosening the cutoff
+            # generally (which would risk confusing different blood types
+            # with each other, e.g. "A+" with "B+").
+            for w in words:
+                if id(w) in consumed:
+                    continue
+                corrected = w.text.replace("0", "O")
+                if corrected in pat.BLOOD_GROUP_VALUES:
+                    blood = (w, corrected, None)
+                    break
         flag_run = self._find_flag_run(words, consumed)
         if blood:
             w, value, sugg = blood
@@ -437,6 +463,28 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             if na_before:
                 w = max(na_before, key=lambda w: (w.line_num, w.x))
                 claim("blood_group", [w], "N.A", w.text)
+
+        # PhNo_2 is also immediately before the flags run in schema order
+        # (City_2, State_2, Zip_2, Country_2, PhNo_2, Alcoholic, ...) -
+        # verified against real ground-truth data that it's very often
+        # explicitly "N.A" rather than a real second phone number, which
+        # _extract_phones alone has no way to recognize (it only looks for
+        # phone-shaped digit patterns). Same reading-order fallback as
+        # Blood Group: the last explicit-N.A word before the flags run.
+        if len(phones) <= 1 and flag_run:
+            run_ids = {id(w) for w, _ in flag_run}
+            run_start = (flag_run[0][0].line_num, flag_run[0][0].x)
+            na_before_phone = [
+                w
+                for w in words
+                if id(w) not in consumed
+                and id(w) not in run_ids
+                and (w.line_num, w.x) < run_start
+                and closest_enum_match(w.text, pat.EXPLICIT_NA_VALUES, cutoff=0.8)
+            ]
+            if na_before_phone:
+                w = max(na_before_phone, key=lambda w: (w.line_num, w.x))
+                claim("phno_2", [w], "N.A", w.text)
 
         # --- YES/NO/N.A flags x5: Alcoholic, Smoker, Past Surg, Diabetic, Allergies ---
         # Best-effort positional assumption (documented, not guaranteed): the
@@ -672,6 +720,44 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         if not candidates_found:
             return None
         if state_word is not None:
+            # Verified against real ground-truth data: now that short
+            # (3-4 digit) zips are matchable, a plain nearest-by-Y-distance
+            # sort can tie with an unrelated same-row number (e.g. a street
+            # address's leading number, "140" in "140 Willow Criik Canyon
+            # Rd", sits at the same y as the real zip and is the same
+            # length). The real Zip always sits immediately after the State
+            # token on its own line with only a small gap (the same
+            # adjacency already used to validate a state match itself) -
+            # prefer that candidate first, before falling back to pure
+            # Y-distance for the rare case where Zip wraps to a different
+            # line than its State (as City_2 itself sometimes does).
+            same_line_after = [
+                (m, mw)
+                for m, mw in candidates_found
+                if mw[0].line_num == state_word.line_num
+                and mw[0].x > state_word.x
+                and mw[0].x - state_word.right <= max(mw[0].height, state_word.height) * 4
+            ]
+            if same_line_after:
+                same_line_after.sort(key=lambda item: item[1][0].x)
+                m, mw = same_line_after[0]
+                return mw, m.group(0), m.group(0)
+            # No precisely-anchored candidate on State's own line - fall
+            # back to nearest-by-Y-distance, but restrict it to genuine
+            # 5-digit zips only. Verified against real ground-truth data
+            # that allowing the newly-matchable 3-4 digit candidates into
+            # this UNANCHORED distance-only comparison caused a real
+            # regression: Height/Weight are also 3-digit numbers and
+            # sometimes the geometrically nearest short number to a state
+            # with no real zip found nearby, corrupting Height/Weight/
+            # Tablets (which then shift into each other's slots) instead of
+            # just leaving Zip unfound. The short-zip support only pays off
+            # in the precisely-anchored same-line case above.
+            candidates_found = [
+                (m, mw) for m, mw in candidates_found if len(m.group(0).split("-")[0]) == 5
+            ]
+            if not candidates_found:
+                return None
             state_y = state_word.y
             candidates_found.sort(key=lambda item: abs((item[1][0].y if item[1] else 0) - state_y))
         m, mw = candidates_found[0]
@@ -772,14 +858,67 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # word closest to the state and stopping at the first gap wider than
         # the words' own height (a resolution-independent proxy for "about
         # one character wide") keeps the run to one contiguous phrase.
+        # Verified against real ground-truth data: when Res Address and
+        # City share one line with no real gap at all between them (e.g.
+        # "13070 PFilFLi AVi AK STEEL" - every word is ~4px apart
+        # throughout), the gap check alone can't tell them apart, and the
+        # walk reached straight through the street address too. A street-
+        # suffix word ("AVi" = "AVE") marks exactly where the address ends
+        # and the city begins - stop there rather than include it.
+        upper_suffix = pat.STREET_SUFFIX_WORDS | pat.STREET_SUFFIX_WORDS_OCR_VARIANTS
         contiguous: list[OCRWord] = [same_line[-1]]
         for w in reversed(same_line[:-1]):
             gap = contiguous[0].x - w.right
             if gap > max(w.height, contiguous[0].height) * 0.8:
                 break
+            if w.text.upper() in upper_suffix:
+                break
             contiguous.insert(0, w)
         picked = contiguous[-5:]
         return picked, " ".join(w.text for w in picked)
+
+    # A real US place name is recognizable even without the ALL CAPS
+    # signal via these extremely common endings. Used ONLY as a narrow,
+    # single-word fallback below (see _extract_city_fallback) for the
+    # genuine minority of city names in this document that print in
+    # ordinary Title Case (e.g. "Mechanicsville") instead - never as a
+    # general city/name disambiguator, since it can't distinguish a
+    # multi-word Title Case city from an adjacent Title Case Shipper Name
+    # with no gap between them (a real, acknowledged limitation).
+    _PLACE_NAME_SUFFIXES = (
+        "VILLE", "BURG", "BORO", "BOROUGH", "TON", "TOWN", "FIELD", "DALE",
+        "WOOD", "LAND", "VIEW", "PARK", "SIDE", "FORD", "PORT", "CHESTER",
+        "SHIRE", "WORTH", "FALLS", "SPRINGS", "HEIGHTS", "POINT", "CREEK",
+    )
+
+    @classmethod
+    def _extract_city_fallback(
+        cls, words: list[OCRWord], consumed: set[int], state_word: OCRWord
+    ) -> tuple[list[OCRWord], str] | None:
+        """Only used when the ALL-CAPS city search above finds nothing on
+        this line. Conservative by design: claims at most the single word
+        immediately before State whose ending matches a common US place-
+        name suffix, rather than guessing how many of the preceding Title
+        Case words belong to the city instead of an adjacent Shipper/STM
+        Name run (there is no reliable gap to cut on in this case, so
+        anything wider than one word would be a guess, not a measurement)."""
+        same_line = [
+            w
+            for w in words
+            if id(w) not in consumed
+            and w.page == state_word.page
+            and w.line_num == state_word.line_num
+            and w.x < state_word.x
+            and w.text.isalpha()
+            and not cls._is_city_noise_word(w.text)
+        ]
+        if not same_line:
+            return None
+        same_line.sort(key=lambda w: w.x)
+        last = same_line[-1]
+        if any(last.text.upper().endswith(suf) for suf in cls._PLACE_NAME_SUFFIXES):
+            return [last], last.text
+        return None
 
     @staticmethod
     def _find_flag_run(words: list[OCRWord], consumed: set[int]) -> list[tuple[OCRWord, str]]:
@@ -799,7 +938,15 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             if len(current) > len(best):
                 best = list(current)
             prev_line = w.line_num
-        return best[:5]
+        # Verified against real ground-truth data that the detected run is
+        # sometimes 6 tokens long because PhNo_2's own explicit "N.A" sits
+        # with no gap immediately before the true 5-flag run (PhNo_2 is the
+        # field directly before Alcoholic in schema order) - truncating to
+        # the FIRST 5 took that leading N.A as if it were Alcoholic's own
+        # answer and silently dropped the real last flag (Allergies) off
+        # the end. The trailing 5 are the real flags; whatever's ahead of
+        # them belongs to an earlier field, not this one.
+        return best[-5:]
 
     @staticmethod
     def _extract_flags(words: list[OCRWord], consumed: set[int]) -> list[tuple[OCRWord, str]]:
@@ -956,6 +1103,16 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         if dosage_pos is not None:
             head = [f for f in found if f[0] < dosage_pos]
             tail = [f for f in found if f[0] >= dosage_pos]
+        elif len(found) == 5:
+            # Verified against real ground-truth data: when Dosage wasn't
+            # matched in this pass (no anchor to split on), P_Inst's own
+            # currency value was falling into the tail group instead of
+            # being recognized as P_Inst, bumping Pill Rate/Cost/Shipping
+            # Cost/Total Amount each one slot out of place. P_Inst
+            # structurally comes first in reading order among this
+            # record's currency fields, so with exactly 5 found and no
+            # better anchor, the first one is the safest P_Inst guess.
+            head, tail = [found[0]], found[1:]
         else:
             head, tail = [], found
 
@@ -999,6 +1156,17 @@ class RuleBasedExtractionEngine(ExtractionEngine):
     ) -> list[tuple[list[OCRWord], str]]:
         found: list[tuple[int, list[OCRWord], str]] = []
         for m in HASH_CODE.finditer(text):
+            # Verified against real ground-truth data: the separator-based
+            # alternative also matches ordinary period-joined person names,
+            # a real documented name shape in this schema (e.g.
+            # "Eric.Turcotte", "H.Garland") - a period is a valid separator
+            # character, and nothing else in the pattern rules out a plain
+            # alphabetic surname on each side. Every confirmed real code
+            # contains at least one digit somewhere; a period-joined name
+            # never does - reject matches with no digit at all rather than
+            # loosen the shared regex itself.
+            if not any(ch.isdigit() for ch in m.group(0)):
+                continue
             mw = [w for w in words_in_span(spans, m.start(), m.end()) if id(w) not in consumed]
             if mw:
                 found.append((m.start(), mw, m.group(0)))
@@ -1018,6 +1186,20 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 if upper.endswith(name) and len(value) > len(name):
                     value = value[: -len(name)]
                     break
+            # Verified against the real ground-truth XML directly: of 568
+            # Policy No values with the "FR-DLI09_" prefix, 566 (99.6%) have
+            # a lowercase "i" immediately after it - the only 2 exceptions
+            # are themselves ground-truth noise (a stray "1" and a stray
+            # "!"), not evidence of real template variation. This is a
+            # constant code prefix, not free-form user data, and "1"/"I"/
+            # "l" are classic OCR-confusable glyphs for "i" - narrow,
+            # evidence-backed, and restricted to this exact template
+            # position only.
+            prefix = "FR-DLI09_"
+            if value.upper().startswith(prefix) and len(value) > len(prefix):
+                next_char = value[len(prefix)]
+                if next_char in "1Il":
+                    value = value[: len(prefix)] + "i" + value[len(prefix) + 1 :]
             results.append((mw, value))
         return results
 
@@ -1118,12 +1300,24 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # regardless of case (a run growing from 2->3->4 words contributes
         # one entry per length, which is fine - counting below only cares
         # whether an exact sequence recurs).
+        # Verified against real ground-truth data: checking only "same
+        # line" let a run merge straight into unrelated adjacent text with
+        # no real gap check (e.g. "Lamb103 Cmt579" - the real 2-word name,
+        # repeated elsewhere for Billing Name/Name_P_Holder - absorbing a
+        # directly-adjacent STM Name run into one 4-word window,
+        # "Lamb103 Cmt579Hergert Kemler"). Same gap-based contiguity check
+        # already proven for city/shipper/STM name extraction: stop
+        # extending a run at the first horizontal gap wider than the
+        # words' own height.
         runs: list[list[OCRWord]] = []
         current: list[OCRWord] = []
         prev_line = None
         for w in ordered:
             same_line = prev_line is None or w.line_num == prev_line
-            if word_like(w) and same_line:
+            close_enough = (
+                not current or w.x - current[-1].right <= max(w.height, current[-1].height) * 0.8
+            )
+            if word_like(w) and same_line and close_enough:
                 current.append(w)
             else:
                 current = [w] if word_like(w) else []
@@ -1139,6 +1333,15 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # (e.g. "Park Avi Apt"). An exact sequence repeating 2+ times is a
         # far stronger name signal than capitalization shape alone, so it's
         # tried first; the longest repeated run wins if more than one repeats.
+        # Tried folding classic OCR confusables (0/O, 1/I/L) into the repeat-
+        # detection key, on the theory that the same physical name printed
+        # 2-3 times sometimes differs between occurrences by exactly one
+        # such character (e.g. "Dlcrouse" vs "DIcrouse"). Measured on real
+        # held-out data: it did not fix the targeted case (the real
+        # mismatch there has a different cause, not yet found) and
+        # introduced a new one elsewhere ("Epike Dlb2" vs "Dib2" - folding
+        # merged two genuinely different short alnum tokens). Reverted; a
+        # net regression, not a net improvement.
         counts: dict[tuple[str, ...], int] = {}
         for run in runs:
             key = tuple(w.text.upper() for w in run)
@@ -1169,7 +1372,10 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 and not (len(w.text) >= 3 and w.text.isupper())
             )
             same_line = prev_line is None or w.line_num == prev_line
-            if is_title and same_line:
+            close_enough = (
+                not current or w.x - current[-1].right <= max(w.height, current[-1].height) * 0.8
+            )
+            if is_title and same_line and close_enough:
                 current.append(w)
             else:
                 current = [w] if is_title else []

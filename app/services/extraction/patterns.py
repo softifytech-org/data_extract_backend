@@ -63,7 +63,13 @@ PHONE_PUNCTUATED = re.compile(r"\(?\d{3}\)?[\s\-=~_.]*\d{3}\s*-\s*\d{4}")
 # under a strict \b\d{10}\b (there's no internal word boundary to anchor on).
 PHONE_BARE = re.compile(r"\b1?(\d{10})\b")
 
-ZIP_CODE = re.compile(r"\b\d{5}(?:-\d{4})?\b")
+# Verified against real ground-truth data: this document family's zip codes
+# are sometimes stored/printed with a leading zero dropped (e.g. a real
+# New Jersey zip "08095" appearing as "8095", 4 digits) - a strict 5-digit
+# requirement made the REAL zip invisible as a candidate, so _extract_zip's
+# fallback picked a nearby unrelated 5-digit number instead (usually the
+# other zip slot's own value, producing a systematic Zip_1/Zip_2 swap).
+ZIP_CODE = re.compile(r"\b\d{3,5}(?:-\d{4})?\b")
 
 # Digit-confusable class reused (not just \d) so an OCR-garbled amount like
 # "$2.o0.00" is captured whole as ONE candidate rather than the regex
@@ -121,6 +127,28 @@ STREET_ADDRESS = re.compile(
     r"Ct\.?|Court|Way|Pkwy\.?|Parkway|Terrace|Ter\.?|Trail|Place|Pl\.?|Loop|Square|Sq\.?)\b",
     re.IGNORECASE,
 )
+
+# Street-suffix words, used as a STOP SIGNAL when walking backward from a
+# state to find the city (see _extract_city): when there is no physical
+# gap at all between Res Address and City on one line (verified against
+# real ground-truth data - "13070 PFilFLi AVi AK STEEL" has uniformly
+# small ~4px gaps throughout), a street-suffix word marks the end of the
+# address and the start of whatever comes after it (the city), and
+# everything at or before it belongs to the address, not the city.
+STREET_SUFFIX_WORDS = {
+    "ST", "STREET", "AVE", "AVENUE", "DR", "DRIVE", "RD", "ROAD", "LN", "LANE",
+    "BLVD", "CIR", "CIRCLE", "CT", "COURT", "WAY", "PKWY", "PARKWAY",
+    "TERRACE", "TER", "TRAIL", "PLACE", "PL", "LOOP", "SQUARE", "SQ", "VIEW",
+}
+# This document consistently OCRs a printed "E" as "I" in these suffix
+# words specifically (confirmed against real ground truth: "Drivi"=Drive,
+# "Circli"=Circle, "Lani"=Lane, "Striit"=Street, "Viiw"=View, "Avi"=Ave -
+# the position of the substitution varies, so this isn't generic fuzzy
+# edit-distance, which can't safely separate real cases like "AVI"~"AVE"
+# (ratio 0.667) from false positives like "STEEL"~"STREET" (ratio 0.727,
+# a higher ratio than a real case). Checking exact equality against each
+# suffix's own "every E replaced by I" form is precise instead of fuzzy.
+STREET_SUFFIX_WORDS_OCR_VARIANTS = {s.replace("E", "I") for s in STREET_SUFFIX_WORDS}
 
 US_STATE_ABBREVIATIONS = {
     "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN",
