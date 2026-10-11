@@ -533,11 +533,23 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             # onto hash codes) - stripping a trailing match is safe and
             # unambiguous.
             upper = value.upper()
+            stripped_drug = None
             for drug in pat.DRUG_NAMES:
                 if upper.endswith(drug) and len(value) > len(drug):
                     value = value[: -len(drug)].rstrip()
+                    stripped_drug = drug
                     break
             claim("card_name", mw, value, value, note=suggestion_note(sugg))
+            # Verified against record 241021 (dev set): the stripped drug
+            # name ("XANAX" in "American ExpressXANAX") was being
+            # discarded entirely - the whole glued word is consumed by
+            # card_name's own claim above, so medicine's own later,
+            # separate search (which needs its own standalone word) could
+            # never find it. We already know exactly which drug it is
+            # here, so claim medicine with it directly instead of losing
+            # the information.
+            if stripped_drug:
+                claim("medicine", mw, stripped_drug, stripped_drug)
 
         # --- medicine (drug name vocabulary) ---
         drug_match = self._match_single_token_enum(words, consumed, pat.DRUG_NAMES)
