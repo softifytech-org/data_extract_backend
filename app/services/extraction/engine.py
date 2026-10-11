@@ -781,14 +781,23 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             # signal than pure nearest-by-Y-distance, which previously
             # picked an unrelated same-length number from a different
             # line instead (here, a street address's leading "10333").
-            # Restricted to genuine 5-digit zips and to being the
-            # leftmost word on that line, matching how a wrapped value
-            # naturally starts a fresh line in this form's column grid.
+            # Verified against record 241101 (dev set): real Zip_2 "955"
+            # is only 3 digits (a short/truncated Puerto Rico zip, a
+            # confirmed real shape in this dataset) and was being
+            # excluded by a 5-digit-only restriction here, leaving this
+            # check empty and falling through to the unanchored Y-
+            # distance fallback below, which grabbed an unrelated 5-digit
+            # number instead (the res address's own house number). That
+            # 5-digit restriction exists to keep the UNANCHORED fallback
+            # below from confusing Height/Weight with a real zip by pure
+            # proximity - this check isn't unanchored, it additionally
+            # requires being the leftmost word on the specific line right
+            # after State, which is precise enough to safely accept the
+            # full 3-5 digit ZIP_CODE range.
             next_line = [
                 (m, mw)
                 for m, mw in candidates_found
                 if mw[0].line_num == state_word.line_num + 1
-                and len(m.group(0).split("-")[0]) == 5
             ]
             if next_line:
                 next_line.sort(key=lambda item: item[1][0].x)
