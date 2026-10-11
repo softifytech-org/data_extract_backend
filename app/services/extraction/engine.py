@@ -1799,6 +1799,32 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 and w.text.lower() not in dup_name_tokens
             ]
             shipper_tokens = self._trailing_contiguous_run(candidates_ship)
+            # Verified against record 241029 (dev set): Shipper Name
+            # itself sometimes wraps across the line break ("David" ends
+            # one line, "Martowska" starts the next), the same way
+            # City_2 does - _trailing_contiguous_run can't cross a line
+            # boundary, so the wrap left only "Martowska" (1 word),
+            # failing the >=2 check entirely. A dedicated, narrowly-
+            # scoped recovery (not a change to the shared helper, which
+            # also serves the unrelated city_2 recovery below): when
+            # exactly one token remains, look for a continuation on the
+            # line directly above, reusing the SAME already-filtered
+            # candidates_ship pool (not a fresh raw-word search) - this
+            # is the key difference from an earlier, reverted city_2 fix
+            # that searched raw ALL-CAPS words on the row above and
+            # ended up stealing unrelated fields' text. Restricted to
+            # the rightmost candidate on that line, and only when the
+            # remaining token is itself the leftmost candidate on its
+            # own line (confirming it genuinely starts a wrapped run,
+            # not a mid-row fragment).
+            if len(shipper_tokens) == 1:
+                only = shipper_tokens[0]
+                same_line_candidates = [w for w in candidates_ship if w.line_num == only.line_num]
+                if same_line_candidates and min(same_line_candidates, key=lambda w: w.x).x == only.x:
+                    prev_line_candidates = [w for w in candidates_ship if w.line_num == only.line_num - 1]
+                    if prev_line_candidates:
+                        wrap_word = max(prev_line_candidates, key=lambda w: w.x)
+                        shipper_tokens = [wrap_word, only]
             if len(shipper_tokens) >= 2:
                 shipper_value = " ".join(w.text for w in shipper_tokens)
                 claim("shipper_name", shipper_tokens, shipper_value, shipper_value)
