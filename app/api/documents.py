@@ -246,7 +246,7 @@ def _revalidate_entry(entry, settings: Settings) -> None:
         )
         f.confidence = score
         f.status = field_status_for_score(
-            score, settings.confidence_high_threshold, has_value=bool(f.value)
+            score, settings.confidence_high_threshold, has_value=bool(f.value), field_name=name
         )
         f.validation.format_valid = format_valid
         f.validation.business_rule_valid = business_valid
