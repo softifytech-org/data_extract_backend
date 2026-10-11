@@ -1654,27 +1654,38 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 shipper_value = " ".join(w.text for w in shipper_tokens)
                 claim("shipper_name", shipper_tokens, shipper_value, shipper_value)
 
-                # City_2 sometimes wraps onto a different visual line than
-                # State_2 (verified against real ground-truth data: Shipper
-                # Name + City_2 share one line, State_2 starts the next),
-                # which _extract_city's same-line-as-state check can't
-                # reach. Recover it the same way Shipper Name itself was
-                # recovered: the trailing ALL-CAPS run between the end of
-                # Shipper Name and State_2's own position.
-                if candidates.get("city_2") is None and state_2_key is not None:
-                    city2_candidates = [
-                        w
-                        for w in words
-                        if id(w) not in consumed
-                        and max((x.line_num, x.x) for x in shipper_tokens) < (w.line_num, w.x) < state_2_key
-                        and w.text.isalpha()
-                        and w.text.isupper()
-                        and not self._is_city_noise_word(w.text)
-                    ]
-                    city2_run = self._trailing_contiguous_run(city2_candidates)
-                    if city2_run:
-                        city2_value = " ".join(w.text for w in city2_run)
-                        claim("city_2", city2_run, city2_value, city2_value)
+            # City_2 sometimes wraps onto a different visual line than
+            # State_2 (verified against real ground-truth data: Shipper
+            # Name + City_2 share one line, State_2 starts the next), which
+            # _extract_city's same-line-as-state check can't reach. Recover
+            # it the same way Shipper Name itself was recovered: the
+            # trailing run between the end of Shipper Name and State_2's
+            # own position - not restricted to ALL CAPS (verified against
+            # record 241074: "livingston" wraps this way in ordinary
+            # lowercase, same as the Title Case minority
+            # _extract_city_fallback already accounts for in the same-line
+            # case). Not nested inside the shipper_tokens>=2 check above:
+            # verified against the same record that Shipper Name can be
+            # genuinely absent (its own row held only an explicit "N/A"
+            # annotation) while City_2 still wrapped onto that row - the
+            # two are coupled by row position, not by whether Shipper Name
+            # itself was found, so this uses the primary name's own end
+            # position as a fallback left boundary when shipper_tokens is
+            # empty.
+            if candidates.get("city_2") is None and state_2_key is not None:
+                city2_left = max((x.line_num, x.x) for x in shipper_tokens) if shipper_tokens else anchor
+                city2_candidates = [
+                    w
+                    for w in words
+                    if id(w) not in consumed
+                    and city2_left < (w.line_num, w.x) < state_2_key
+                    and w.text.isalpha()
+                    and not self._is_city_noise_word(w.text)
+                ]
+                city2_run = self._trailing_contiguous_run(city2_candidates)
+                if city2_run:
+                    city2_value = " ".join(w.text for w in city2_run)
+                    claim("city_2", city2_run, city2_value, city2_value)
 
         if stm_code_start_key is not None:
             candidates_stm = [
