@@ -1611,6 +1611,20 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # substantially, but the trailing-contiguous-run walk already
         # isolates just the real name regardless of window width (the same
         # mechanism that made the tight City_2 case work).
+        # Verified against a real image crop (record 241114, 09112.jpeg):
+        # the form reprints Billing Name/Name_P_Holder's own text directly
+        # on the SAME line as Shipper Name and STM Name ("Enkay1 Matschek
+        # Fredrick Beckman", "Enkay1 Matschek Janica Louise Fallon") as part
+        # of the same duplicate-field pattern already confirmed for dates -
+        # that redundant occurrence is never consumed elsewhere, so it sits
+        # right there as more Title-Case, non-all-caps "name-shaped" text,
+        # indistinguishable by shape or gap width alone from the real
+        # Shipper/STM Name that follows it. Since the duplicate name's own
+        # text is already known at this point, excluding its exact tokens
+        # is a precise, narrow filter - not a guess at what a city or name
+        # "looks like" (a US place-name reference would not have caught
+        # this: "Matschek" is a surname, not a place).
+        dup_name_tokens = {t.lower() for t in value.split()}
         right_boundary = city2_start_key or state_2_key or policy_no_start_key
         if right_boundary is not None:
             anchor = max((w.line_num, w.x) for w in mw)
@@ -1622,6 +1636,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 and re.fullmatch(r"[A-Za-z][A-Za-z_.]+", w.text)
                 and w.text.upper() not in NOISE_TOKENS
                 and not w.text.isupper()
+                and w.text.lower() not in dup_name_tokens
             ]
             shipper_tokens = self._trailing_contiguous_run(candidates_ship)
             if len(shipper_tokens) >= 2:
@@ -1660,6 +1675,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 and w.text[0].isupper()
                 and not (len(w.text) >= 3 and w.text.isupper())
                 and w.text.upper() not in NOISE_TOKENS
+                and w.text.lower() not in dup_name_tokens
             ]
             stm_tokens = self._trailing_contiguous_run(candidates_stm)
             if len(stm_tokens) >= 2:
