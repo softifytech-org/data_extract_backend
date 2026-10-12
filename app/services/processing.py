@@ -263,19 +263,41 @@ def process_document(
 
         extraction_engine = RuleBasedExtractionEngine()
         all_entries: list[RecordEntry] = []
-        for page_index, image in enumerate(images, start=1):
-            page_entries = _process_page(
-                image,
-                page_index=page_index,
-                ocr_engine=ocr_engine,
-                paddle_engine=paddle_engine,
-                extraction_engine=extraction_engine,
-                confidence_high_threshold=settings.confidence_high_threshold,
-                paddle_escalation_threshold=settings.confidence_medium_threshold,
-                starting_record_index=len(all_entries) + 1,
-                original_filename=record.source_file.original_filename,
-            )
-            all_entries.extend(page_entries)
+        # Azure gets its own whole-page pipeline (one API call per page,
+        # not per record crop or per preprocessing variant) - see
+        # services/azure_processing.py's module docstring for why this is
+        # a genuinely different, separately-validated path rather than a
+        # drop-in engine swap into the Tesseract ensemble below.
+        from app.services.ocr.azure_engine import AzureDocumentIntelligenceEngine
+
+        if isinstance(ocr_engine, AzureDocumentIntelligenceEngine):
+            from app.services.azure_processing import process_page_azure
+
+            for page_index, image in enumerate(images, start=1):
+                page_entries = process_page_azure(
+                    image,
+                    engine=ocr_engine,
+                    extraction_engine=extraction_engine,
+                    page_index=page_index,
+                    starting_record_index=len(all_entries) + 1,
+                    confidence_high_threshold=settings.confidence_high_threshold,
+                    original_filename=record.source_file.original_filename,
+                )
+                all_entries.extend(page_entries)
+        else:
+            for page_index, image in enumerate(images, start=1):
+                page_entries = _process_page(
+                    image,
+                    page_index=page_index,
+                    ocr_engine=ocr_engine,
+                    paddle_engine=paddle_engine,
+                    extraction_engine=extraction_engine,
+                    confidence_high_threshold=settings.confidence_high_threshold,
+                    paddle_escalation_threshold=settings.confidence_medium_threshold,
+                    starting_record_index=len(all_entries) + 1,
+                    original_filename=record.source_file.original_filename,
+                )
+                all_entries.extend(page_entries)
 
         if not all_entries:
             raise EmptyOcrResultError(

@@ -4,10 +4,16 @@ pydantic==2.10.4
 pydantic-settings==2.7.1
 python-multipart==0.0.20
 pytesseract==0.3.13
-opencv-python==4.10.0.84
+# opencv-python (not opencv-python-headless) needs libGL and other GUI
+# libs that a minimal Linux server/container (e.g. Render) does not have
+# by default and will fail to import without - headless provides the
+# identical cv2 API for this project's purely server-side image use.
+opencv-python-headless==4.10.0.84
 Pillow==11.1.0
 pdf2image==1.17.0
 numpy==2.2.1
 openpyxl==3.1.5
 pytest==8.3.4
 httpx==0.28.1
+azure-ai-documentintelligence==1.0.2
+azure-core==1.41.0

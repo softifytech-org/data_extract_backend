@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: ocr-data-entry-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: DOCUMENTINTELLIGENCE_ENDPOINT
+        sync: false
+      - key: DOCUMENTINTELLIGENCE_API_KEY
+        sync: false
+      - key: FRONTEND_ORIGIN
+        sync: false
+    # NOTE: Render's free plan does not support attaching a persistent
+    # disk, and free web services also spin down after 15 min idle and
+    # wipe their filesystem on every restart/redeploy. That means
+    # data/records, data/submissions(.db), and data/uploads will NOT
+    # survive a restart on the free plan - fine for a quick functional
+    # test, not for anything meant to keep data. To persist for real,
+    # upgrade this service to a paid plan and add a `disk:` block here
+    # mounted at /app/data, or move storage to an external managed DB.

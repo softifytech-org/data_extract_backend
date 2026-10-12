@@ -45,6 +45,7 @@ from app.schemas.document import (
 )
 from app.services.ai_vision import AIVisionError, extract_fields_via_vision
 from app.services.errors import EmptyOcrResultError, InvalidImageError
+from app.services.export.dump_xml_export import submit_document
 from app.services.export.excel_export import export_record_to_excel
 from app.services.export.xml_export import export_record_to_xml
 from app.services.extraction.fields import FIELD_SPEC_BY_NAME
@@ -495,3 +496,54 @@ def export_xml(
         raise HTTPException(status_code=409, detail="Document has not been processed yet")
     output_path = export_record_to_xml(record, settings.exports_dir)
     return FileResponse(path=output_path, filename=f"{document_id}.xml", media_type="application/xml")
+
+
+@router.post("/{document_id}/submit")
+def submit_document_endpoint(
+    document_id: str,
+    body: ApproveRequest,
+    settings: Settings = Depends(get_settings),
+    repo: JsonDocumentRepository = Depends(get_repository),
+) -> dict:
+    """Writes every record in this document to the legacy dump XML schema
+    (same field tags as the real DataM.xml dump) - both as a flat file
+    under data/submissions/ and as rows in data/submissions.db (SQLite).
+    Does not require full approval first - this is a separate, explicit
+    "send this data out" action a reviewer can take as soon as the
+    document has been processed, same way the existing Excel/XML
+    downloads don't require approval either."""
+    record = _get_record_or_404(repo, document_id)
+    if record.status == DocumentStatus.UPLOADED:
+        raise HTTPException(status_code=409, detail="Document has not been processed yet")
+    if not record.records:
+        raise HTTPException(status_code=409, detail="No records to submit")
+
+    if body.approved_by:
+        for entry in record.records:
+            entry.approved_by = entry.approved_by or body.approved_by
+        record.touch()
+        repo.save(record)
+
+    try:
+        xml_path, rows_written = submit_document(record, settings.submissions_dir, settings.submissions_db_path)
+    except Exception as exc:  # noqa: BLE001 - surface a clean error to the UI
+        logger.exception("Submit failed for document %s", document_id)
+        raise HTTPException(status_code=500, detail="Submit failed - see server logs") from exc
+
+    logger.info("Document %s submitted (%d record(s))", document_id, rows_written)
+    return {
+        "document_id": document_id,
+        "xml_path": str(xml_path),
+        "records_submitted": rows_written,
+    }
+
+
+@router.get("/{document_id}/submit/download")
+def download_submission_xml(
+    document_id: str,
+    settings: Settings = Depends(get_settings),
+) -> FileResponse:
+    path = settings.submissions_dir / f"{document_id}.xml"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="This document has not been submitted yet")
+    return FileResponse(path=path, filename=f"{document_id}_submission.xml", media_type="application/xml")
