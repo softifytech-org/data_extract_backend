@@ -13,20 +13,29 @@ remain whole-document actions.
 from __future__ import annotations
 
 import cv2
-from fastapi import APIRouter, Depends, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+import numpy as np
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, Response
 
+from app.core.auth import CurrentUser, get_current_user_optional
 from app.core.config import Settings, get_settings
-from app.core.dependencies import get_ocr_engine, get_paddle_engine, get_repository
+from app.core.dependencies import (
+    get_app_db,
+    get_file_store,
+    get_file_store_for_record,
+    get_ocr_engine,
+    get_paddle_engine,
+    get_repository,
+)
 from app.core.logging_config import get_logger
 from app.core.security import (
     UnsafeFilenameError,
     UnsupportedFileTypeError,
     generate_document_id,
-    safe_storage_path,
     sanitize_original_filename,
     validate_upload,
 )
+from app.services.storage.blob_store import FileStore, StorageUnavailableError
 from app.models.document import (
     AuditInfo,
     DocumentRecord,
@@ -51,6 +60,7 @@ from app.services.export.xml_export import export_record_to_xml
 from app.services.extraction.fields import FIELD_SPEC_BY_NAME
 from app.services.ocr.base import OCREngine
 from app.services.preprocessing.pdf_processing import CorruptPdfError
+from app.services.storage.app_db import AppDatabase
 from app.services.preprocessing.record_cropping import crop_record
 from app.services.processing import process_document
 from app.services.storage.json_storage import DocumentNotFoundError, JsonDocumentRepository
@@ -72,6 +82,15 @@ def _get_record_or_404(repo: JsonDocumentRepository, document_id: str) -> Docume
         raise HTTPException(status_code=400, detail="Invalid document id") from None
 
 
+def _check_access(document_id: str, current_user: CurrentUser | None, db: AppDatabase) -> None:
+    """No-op - this application has no authentication anywhere (explicit
+    decision; see app/api/batches.py's module docstring and the final
+    report). Kept as a function, rather than deleted along with its call
+    sites in every route below, to keep this change's diff small and
+    low-risk; it intentionally does nothing with either argument."""
+    return
+
+
 def _get_entry_or_404(record: DocumentRecord, record_index: int):
     for entry in record.records:
         if entry.record_index == record_index:
@@ -82,11 +101,15 @@ def _get_entry_or_404(record: DocumentRecord, record_index: int):
 @router.post("/upload", response_model=UploadResponse)
 async def upload_document(
     file: UploadFile,
+    layout: str = Form("old"),
     settings: Settings = Depends(get_settings),
     repo: JsonDocumentRepository = Depends(get_repository),
+    file_store: FileStore = Depends(get_file_store),
 ) -> UploadResponse:
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
+    if layout not in ("old", "new"):
+        raise HTTPException(status_code=400, detail="layout must be 'old' or 'new'")
 
     content = await file.read()
     if len(content) == 0:
@@ -104,28 +127,34 @@ async def upload_document(
 
     document_id = generate_document_id()
     try:
-        destination = safe_storage_path(settings.uploads_dir, document_id, extension)
+        storage_key = file_store.save_upload(content, document_id=document_id, extension=extension, batch_id=None)
     except UnsafeFilenameError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    destination.write_bytes(content)
+    except StorageUnavailableError as exc:
+        logger.exception("Could not store uploaded document %s", document_id)
+        raise HTTPException(status_code=502, detail="Could not store the uploaded file. Please try again.") from exc
 
     file_type = "pdf" if extension == ".pdf" else "image"
     record = DocumentRecord(
         document_id=document_id,
         status=DocumentStatus.UPLOADED,
+        layout=layout,
         source_file=SourceFileInfo(
             original_filename=sanitize_original_filename(file.filename),
-            stored_filename=destination.name,
+            stored_filename=storage_key,
             file_type=file_type,
             content_type=file.content_type or "application/octet-stream",
             pages=1,
             size_bytes=len(content),
+            storage_backend=file_store.name,
         ),
         audit=AuditInfo(),
     )
     repo.save(record)
-    logger.info("Document %s uploaded (%s, %d bytes)", document_id, file_type, len(content))
+    logger.info(
+        "Document %s uploaded (%s, %d bytes, backend=%s, layout=%s)",
+        document_id, file_type, len(content), file_store.name, layout,
+    )
 
     return UploadResponse(
         document_id=document_id, status=record.status.value, message="Document uploaded successfully"
@@ -155,9 +184,14 @@ def list_documents(repo: JsonDocumentRepository = Depends(get_repository)) -> li
 
 @router.get("/{document_id}", response_model=DocumentRecord)
 def get_document(
-    document_id: str, repo: JsonDocumentRepository = Depends(get_repository)
+    document_id: str,
+    repo: JsonDocumentRepository = Depends(get_repository),
+    current_user: CurrentUser | None = Depends(get_current_user_optional),
+    db: AppDatabase = Depends(get_app_db),
 ) -> DocumentRecord:
-    return _get_record_or_404(repo, document_id)
+    record = _get_record_or_404(repo, document_id)
+    _check_access(document_id, current_user, db)
+    return record
 
 
 @router.post("/{document_id}/process", response_model=ProcessResponse)
@@ -169,22 +203,26 @@ def process_document_endpoint(
     paddle_engine: OCREngine | None = Depends(get_paddle_engine),
 ) -> ProcessResponse:
     record = _get_record_or_404(repo, document_id)
-    file_path = settings.uploads_dir / record.source_file.stored_filename
-    if not file_path.exists():
+    file_store = get_file_store_for_record(record, settings)
+    if not file_store.upload_exists(record.source_file.stored_filename):
         raise HTTPException(status_code=409, detail="Source file is no longer available")
 
     try:
-        updated = process_document(
-            document_id,
-            file_path=file_path,
-            file_type=record.source_file.file_type,
-            settings=settings,
-            repo=repo,
-            ocr_engine=ocr_engine,
-            paddle_engine=paddle_engine,
-        )
+        with file_store.open_upload_as_local_path(record.source_file.stored_filename) as file_path:
+            updated = process_document(
+                document_id,
+                file_path=file_path,
+                file_type=record.source_file.file_type,
+                settings=settings,
+                repo=repo,
+                ocr_engine=ocr_engine,
+                paddle_engine=paddle_engine,
+            )
     except (InvalidImageError, CorruptPdfError, EmptyOcrResultError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StorageUnavailableError as exc:
+        logger.exception("Could not fetch source file for document %s", document_id)
+        raise HTTPException(status_code=502, detail="Could not retrieve the source file. Please try again.") from exc
     except Exception as exc:  # noqa: BLE001 - convert to a safe generic message
         logger.exception("Unexpected error processing document %s", document_id)
         raise HTTPException(
@@ -199,23 +237,35 @@ def get_document_file(
     document_id: str,
     settings: Settings = Depends(get_settings),
     repo: JsonDocumentRepository = Depends(get_repository),
-) -> FileResponse:
+    current_user: CurrentUser | None = Depends(get_current_user_optional),
+    db: AppDatabase = Depends(get_app_db),
+) -> Response:
     """Serves the original uploaded file so the review UI can display it
     alongside the extracted form. Files live outside any publicly-served
     static directory - this endpoint is the only path to them, and it goes
     through the same document-id validation as every other route."""
     record = _get_record_or_404(repo, document_id)
-    file_path = settings.uploads_dir / record.source_file.stored_filename
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Source file is no longer available")
-    return FileResponse(path=file_path, media_type=record.source_file.content_type)
+    _check_access(document_id, current_user, db)
+    file_store = get_file_store_for_record(record, settings)
+    try:
+        data = file_store.read_upload(record.source_file.stored_filename)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Source file is no longer available") from None
+    except StorageUnavailableError as exc:
+        logger.exception("Could not fetch source file for document %s", document_id)
+        raise HTTPException(status_code=502, detail="Could not retrieve the source file. Please try again.") from exc
+    return Response(content=data, media_type=record.source_file.content_type)
 
 
 @router.get("/{document_id}/results", response_model=DocumentRecord)
 def get_results(
-    document_id: str, repo: JsonDocumentRepository = Depends(get_repository)
+    document_id: str,
+    repo: JsonDocumentRepository = Depends(get_repository),
+    current_user: CurrentUser | None = Depends(get_current_user_optional),
+    db: AppDatabase = Depends(get_app_db),
 ) -> DocumentRecord:
     record = _get_record_or_404(repo, document_id)
+    _check_access(document_id, current_user, db)
     if record.status == DocumentStatus.UPLOADED:
         raise HTTPException(status_code=409, detail="Document has not been processed yet")
     return record
@@ -287,8 +337,11 @@ def update_fields(
     body: FieldsUpdateRequest,
     settings: Settings = Depends(get_settings),
     repo: JsonDocumentRepository = Depends(get_repository),
+    current_user: CurrentUser | None = Depends(get_current_user_optional),
+    db: AppDatabase = Depends(get_app_db),
 ) -> DocumentRecord:
     record = _get_record_or_404(repo, document_id)
+    _check_access(document_id, current_user, db)
     entry = _get_entry_or_404(record, record_index)
 
     unknown = set(body.fields) - set(FIELD_SPEC_BY_NAME)
@@ -318,8 +371,11 @@ def validate_document(
     document_id: str,
     settings: Settings = Depends(get_settings),
     repo: JsonDocumentRepository = Depends(get_repository),
+    current_user: CurrentUser | None = Depends(get_current_user_optional),
+    db: AppDatabase = Depends(get_app_db),
 ) -> DocumentRecord:
     record = _get_record_or_404(repo, document_id)
+    _check_access(document_id, current_user, db)
     for entry in record.records:
         _revalidate_entry(entry, settings)
     _recompute_document_status(record)
@@ -334,12 +390,15 @@ def approve_record(
     body: ApproveRequest,
     settings: Settings = Depends(get_settings),
     repo: JsonDocumentRepository = Depends(get_repository),
+    current_user: CurrentUser | None = Depends(get_current_user_optional),
+    db: AppDatabase = Depends(get_app_db),
 ) -> DocumentRecord:
     """Approves ONE record - the primary workflow: review a record, approve
     it, move to the next. When every record in the document has been
     approved this way, the document itself is marked approved and both
     exports are generated automatically."""
     record = _get_record_or_404(repo, document_id)
+    _check_access(document_id, current_user, db)
     if record.status in (DocumentStatus.UPLOADED, DocumentStatus.PROCESSING, DocumentStatus.FAILED):
         raise HTTPException(
             status_code=409, detail="Document must be successfully processed before approval"
@@ -399,8 +458,12 @@ def ai_verify_record(
     y_start = min(f.bounding_box.y for f in fields_with_bbox)
     y_end = max(f.bounding_box.y + f.bounding_box.height for f in fields_with_bbox)
 
-    file_path = settings.uploads_dir / record.source_file.stored_filename
-    image = cv2.imread(str(file_path))
+    file_store = get_file_store_for_record(record, settings)
+    try:
+        raw = file_store.read_upload(record.source_file.stored_filename)
+    except (FileNotFoundError, StorageUnavailableError) as exc:
+        raise HTTPException(status_code=500, detail="Could not load the source image") from exc
+    image = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
     if image is None:
         raise HTTPException(status_code=500, detail="Could not load the source image")
     crop, _ = crop_record(image, y_start, y_end, margin=15)
@@ -436,8 +499,11 @@ def approve_document(
     body: ApproveRequest,
     settings: Settings = Depends(get_settings),
     repo: JsonDocumentRepository = Depends(get_repository),
+    current_user: CurrentUser | None = Depends(get_current_user_optional),
+    db: AppDatabase = Depends(get_app_db),
 ) -> DocumentRecord:
     record = _get_record_or_404(repo, document_id)
+    _check_access(document_id, current_user, db)
     if record.status in (DocumentStatus.UPLOADED, DocumentStatus.PROCESSING, DocumentStatus.FAILED):
         raise HTTPException(
             status_code=409, detail="Document must be successfully processed before approval"
@@ -473,8 +539,11 @@ def export_excel(
     document_id: str,
     settings: Settings = Depends(get_settings),
     repo: JsonDocumentRepository = Depends(get_repository),
+    current_user: CurrentUser | None = Depends(get_current_user_optional),
+    db: AppDatabase = Depends(get_app_db),
 ) -> FileResponse:
     record = _get_record_or_404(repo, document_id)
+    _check_access(document_id, current_user, db)
     if record.status == DocumentStatus.UPLOADED:
         raise HTTPException(status_code=409, detail="Document has not been processed yet")
     output_path = export_record_to_excel(record, settings.exports_dir)
@@ -490,8 +559,11 @@ def export_xml(
     document_id: str,
     settings: Settings = Depends(get_settings),
     repo: JsonDocumentRepository = Depends(get_repository),
+    current_user: CurrentUser | None = Depends(get_current_user_optional),
+    db: AppDatabase = Depends(get_app_db),
 ) -> FileResponse:
     record = _get_record_or_404(repo, document_id)
+    _check_access(document_id, current_user, db)
     if record.status == DocumentStatus.UPLOADED:
         raise HTTPException(status_code=409, detail="Document has not been processed yet")
     output_path = export_record_to_xml(record, settings.exports_dir)
@@ -504,15 +576,24 @@ def submit_document_endpoint(
     body: ApproveRequest,
     settings: Settings = Depends(get_settings),
     repo: JsonDocumentRepository = Depends(get_repository),
+    current_user: CurrentUser | None = Depends(get_current_user_optional),
+    db: AppDatabase = Depends(get_app_db),
+    file_store: FileStore = Depends(get_file_store),
 ) -> dict:
     """Writes every record in this document to the legacy dump XML schema
     (same field tags as the real DataM.xml dump) - both as a flat file
-    under data/submissions/ and as rows in data/submissions.db (SQLite).
+    under data/submissions/ and as rows in data/submissions.db (SQLite,
+    unchanged: this is what makes CreateDate immutable across a
+    resubmit - see _build_record_metadata), AND to durable storage (Azure
+    Blob Storage when configured, same local file otherwise) - this is the
+    artifact a separate team-lead application depends on for the actual
+    handoff, so it must not only live on this instance's own local disk.
     Does not require full approval first - this is a separate, explicit
     "send this data out" action a reviewer can take as soon as the
     document has been processed, same way the existing Excel/XML
     downloads don't require approval either."""
     record = _get_record_or_404(repo, document_id)
+    _check_access(document_id, current_user, db)
     if record.status == DocumentStatus.UPLOADED:
         raise HTTPException(status_code=409, detail="Document has not been processed yet")
     if not record.records:
@@ -530,7 +611,26 @@ def submit_document_endpoint(
         logger.exception("Submit failed for document %s", document_id)
         raise HTTPException(status_code=500, detail="Submit failed - see server logs") from exc
 
-    logger.info("Document %s submitted (%d record(s))", document_id, rows_written)
+    # Read back the exact bytes just written (same utf-8-sig BOM + CRLF
+    # already applied by write_dump_xml_file) rather than rebuilding the
+    # XML separately - guarantees the durable copy is byte-identical to
+    # the local one, not a second, potentially-diverging render.
+    xml_bytes = xml_path.read_bytes()
+    try:
+        xml_key = file_store.save_xml(xml_bytes, batch_id=document_id)
+    except StorageUnavailableError as exc:
+        logger.exception("Could not store submission XML for document %s", document_id)
+        raise HTTPException(
+            status_code=502, detail="Submitted locally, but could not store the durable XML copy. Please try again."
+        ) from exc
+    # Recorded ONLY after the durable write above actually succeeds - a
+    # reviewer (or the team-lead app re-downloading later) must never see
+    # "submitted" for a copy that doesn't really exist in durable storage.
+    db.upsert_document_submission(document_id, xml_key, file_store.name, rows_written)
+
+    logger.info(
+        "Document %s submitted (%d record(s), durable backend=%s)", document_id, rows_written, file_store.name
+    )
     return {
         "document_id": document_id,
         "xml_path": str(xml_path),
@@ -542,7 +642,31 @@ def submit_document_endpoint(
 def download_submission_xml(
     document_id: str,
     settings: Settings = Depends(get_settings),
-) -> FileResponse:
+    current_user: CurrentUser | None = Depends(get_current_user_optional),
+    db: AppDatabase = Depends(get_app_db),
+) -> Response:
+    _check_access(document_id, current_user, db)
+    submission = db.get_document_submission(document_id)
+    if submission is not None:
+        from app.services.storage.blob_store import get_file_store_by_backend
+
+        file_store = get_file_store_by_backend(submission["xml_storage_backend"], settings)
+        try:
+            data = file_store.read_xml(submission["xml_storage_key"])
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Submitted XML is no longer available") from None
+        except StorageUnavailableError as exc:
+            logger.exception("Could not fetch submitted XML for document %s", document_id)
+            raise HTTPException(
+                status_code=502, detail="Could not retrieve the submission XML. Please try again."
+            ) from exc
+        return Response(
+            content=data, media_type="application/xml",
+            headers={"Content-Disposition": f'attachment; filename="{document_id}_submission.xml"'},
+        )
+    # Fallback for a document submitted before this durable-storage tracking
+    # existed (an older local-only submission row with no document_submissions
+    # entry) - never silently 404 data that genuinely still exists on disk.
     path = settings.submissions_dir / f"{document_id}.xml"
     if not path.exists():
         raise HTTPException(status_code=404, detail="This document has not been submitted yet")

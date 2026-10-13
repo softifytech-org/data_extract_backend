@@ -76,6 +76,17 @@ class Settings(BaseSettings):
     # Off by default so that cost is opt-in, not silently imposed.
     paddleocr_enabled: bool = False
 
+    # Azure Blob Storage - durable storage for uploaded images and
+    # generated submission XML (services/storage/blob_store.py). All four
+    # must be set together, or all left unset (local disk fallback, local
+    # dev/test only - see azure_storage_configured and get_settings()
+    # below, which refuses to start on a PARTIAL configuration rather than
+    # silently guessing).
+    azure_storage_connection_string: str = ""
+    azure_storage_account_name: str = ""
+    azure_upload_container: str = ""
+    azure_xml_container: str = ""
+
     # Per-field review tiers (services/validation/field_reliability.py):
     # routes fields with a measured false-acceptance rate above the agreed
     # safety limit to mandatory review regardless of confidence score, and
@@ -122,10 +133,44 @@ class Settings(BaseSettings):
     def submissions_db_path(self) -> Path:
         return self.data_dir / "submissions.db"
 
+    @property
+    def app_db_path(self) -> Path:
+        return self.data_dir / "app.db"
+
+    @property
+    def _azure_storage_values(self) -> tuple[str, str, str, str]:
+        return (
+            self.azure_storage_connection_string,
+            self.azure_storage_account_name,
+            self.azure_upload_container,
+            self.azure_xml_container,
+        )
+
+    @property
+    def azure_storage_configured(self) -> bool:
+        return all(v.strip() for v in self._azure_storage_values)
+
+    @property
+    def azure_storage_partially_configured(self) -> bool:
+        values = self._azure_storage_values
+        return any(v.strip() for v in values) and not all(v.strip() for v in values)
+
+
+class AzureStorageMisconfiguredError(RuntimeError):
+    pass
+
 
 @lru_cache
 def get_settings() -> Settings:
     settings = Settings()
+    if settings.azure_storage_partially_configured:
+        raise AzureStorageMisconfiguredError(
+            "Azure Blob Storage is partially configured. AZURE_STORAGE_CONNECTION_STRING, "
+            "AZURE_STORAGE_ACCOUNT_NAME, AZURE_UPLOAD_CONTAINER and AZURE_XML_CONTAINER must "
+            "all be set together to use Blob Storage, or all left unset to use local disk "
+            "storage for local dev/test - a partial configuration is refused rather than "
+            "silently falling back."
+        )
     for directory in (
         settings.uploads_dir,
         settings.processing_dir,

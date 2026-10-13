@@ -15,6 +15,9 @@ from app.services.ocr.base import OCREngine
 # compare against it again, but get_ocr_engine() below no longer
 # constructs it by default.
 # from app.services.ocr.tesseract_engine import TesseractEngine
+from app.models.document import DocumentRecord
+from app.services.storage.app_db import AppDatabase
+from app.services.storage.blob_store import FileStore, get_file_store_by_backend, get_write_file_store
 from app.services.storage.json_storage import JsonDocumentRepository
 
 
@@ -26,6 +29,12 @@ class AzureCredentialsMissingError(RuntimeError):
 def get_repository() -> JsonDocumentRepository:
     settings = get_settings()
     return JsonDocumentRepository(settings.records_dir)
+
+
+@lru_cache
+def get_app_db() -> AppDatabase:
+    settings = get_settings()
+    return AppDatabase(settings.app_db_path)
 
 
 @lru_cache
@@ -42,6 +51,34 @@ def get_ocr_engine() -> OCREngine:
     return AzureDocumentIntelligenceEngine(
         settings.documentintelligence_endpoint, settings.documentintelligence_api_key
     )
+
+
+@lru_cache
+def get_file_store() -> FileStore:
+    """The backend NEW uploads/XML are written to (Azure Blob Storage if
+    fully configured, local disk otherwise - see blob_store.py). Used
+    directly as a route dependency (Depends(get_file_store)), so test
+    overrides work the normal FastAPI way."""
+    return get_write_file_store(get_settings())
+
+
+def get_file_store_for_record(record: DocumentRecord, settings: Settings) -> FileStore:
+    """The backend a SPECIFIC document was actually stored with - may
+    differ from get_file_store() above if the live configuration changed
+    after that document was uploaded (see SourceFileInfo.storage_backend
+    and blob_store.py's module docstring).
+
+    Deliberately NOT decorated with @lru_cache and NOT calling
+    get_settings() internally: this is called as a plain function from
+    inside route bodies (it needs `record`, only available after the
+    route already fetched it), so dependency_overrides can never
+    intercept it directly the way it intercepts get_file_store() above -
+    the caller must pass its OWN already-injected `settings` (from its
+    own Depends(get_settings) parameter) so a test override on
+    get_settings still takes effect. See get_app_db/get_repository's
+    bare-function-call pitfall in conftest.py's client fixture docstring
+    for the exact same failure mode this avoids."""
+    return get_file_store_by_backend(record.source_file.storage_backend, settings)
 
 
 @lru_cache

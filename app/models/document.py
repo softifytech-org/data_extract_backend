@@ -121,6 +121,11 @@ class SourceFileInfo(BaseModel):
     content_type: str
     pages: int = 1
     size_bytes: int = 0
+    # Which FileStore backend stored_filename resolves through (see
+    # services/storage/blob_store.py). Defaults to "local" so every
+    # document saved before this field existed keeps resolving via local
+    # disk, regardless of what new uploads are configured to use.
+    storage_backend: str = "local"
 
 
 class AuditInfo(BaseModel):
@@ -151,6 +156,14 @@ class RecordEntry(BaseModel):
 class DocumentRecord(BaseModel):
     document_id: str
     status: DocumentStatus = DocumentStatus.UPLOADED
+    # "old" (the majority tabular layout, ~90% of real volume) or "new"
+    # (the dense wrapped-paragraph layout investigated separately - see
+    # services/extraction/engine.py's RuleBasedExtractionEngine docstring
+    # for exactly which extraction behavior this selects). Set once at
+    # upload time from the caller's explicit choice and never changed
+    # automatically - there is no validated auto-detector, so guessing
+    # silently is deliberately not done.
+    layout: str = "old"
     source_file: SourceFileInfo
     records: list[RecordEntry] = Field(default_factory=list)
     record_count: int = 0

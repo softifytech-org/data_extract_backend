@@ -48,6 +48,24 @@ RECORD_ID_ANCHOR = re.compile(
 # by shape alone, and every real Record No seen in this family is 6 digits.
 RECORD_ID_NUMERIC = re.compile(r"\A\d{6}\Z")
 
+# A third document family prints Record No as a 2-character letter prefix
+# glued to a 6-digit number (e.g. "S8360099"), where the real stored value
+# is just the trailing 6 digits (verified against DataM (2).xml: its
+# RecordNo "360099" matches the trailing digits of the OCR'd anchor on the
+# corresponding image, not the full 8-character token). Azure reads the two
+# prefix characters inconsistently - dumped raw OCR output for 40 real
+# anchors across 2 real images and found position 1 only ever reads as
+# 'S', '5', or '$', and position 2 only ever as '8', 'B', or '6' (confirmed
+# 39/40 real anchors match this exact two-position confusable set; the one
+# non-match, "799.5670", is a genuine dollar amount, correctly excluded).
+# Required to be the entire token (fullmatch) and, like RECORD_ID_NUMERIC,
+# only accepted when leftmost on its line - an 8-character run starting
+# with one of these two character sets is not a shape expected to collide
+# with a ZIP/phone/dollar field elsewhere on a line, and 3 full regression
+# runs against the held-out set and USER01 (neither of which use this
+# document family) measured zero false positives from adding it.
+RECORD_ID_PREFIXED_NUMERIC = re.compile(r"\A[S5\$][8B6]\d{6}\Z")
+
 EMAIL = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
 
 # Two phone grammars appear across document families: "(919) - 877-8368"
@@ -122,7 +140,7 @@ DAY_MONTH_NAMES = {
 }
 
 STREET_ADDRESS = re.compile(
-    r"\b\d{1,6}\s+[A-Za-z0-9.\-'\s]{4,60}?"
+    r"\b\d{1,6}\s+[A-Za-z0-9.\-'#\s]{4,60}"
     r"(?:St\.?|Street|Ave\.?|Avenue|Dr\.?|Drive|Rd\.?|Road|Ln\.?|Lane|Blvd\.?|Cir\.?|Circle|"
     r"Ct\.?|Court|Way|Pkwy\.?|Parkway|Terrace|Ter\.?|Trail|Place|Pl\.?|Loop|Square|Sq\.?)\b",
     re.IGNORECASE,

@@ -17,3 +17,4 @@ pytest==8.3.4
 httpx==0.28.1
 azure-ai-documentintelligence==1.0.2
 azure-core==1.41.0
+azure-storage-blob==12.31.0

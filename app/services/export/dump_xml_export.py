@@ -187,7 +187,13 @@ def _record_to_datam_element(record: DocumentRecord, entry: RecordEntry, metadat
     for our_field, tag in FIELD_TO_DUMP_TAG.items():
         field = entry.fields.get(our_field)
         el = ET.SubElement(datam, tag)
-        el.text = field.value if field and field.value is not None else ""
+        # "N.A" (not "NA"/"N/A"/empty) is the real missing-value convention -
+        # checked directly: 18,310 of 18,468 missing-value-shaped tokens
+        # across the real ground truth use exactly this form; a truly blank
+        # tag occurs in only 18 of 711,200 real field values. This also
+        # means every field now always gets real open+close tags, since
+        # ElementTree only self-closes a tag that has no text at all.
+        el.text = field.value if field and field.value else "N.A"
     for tag in METADATA_TAGS:
         el = ET.SubElement(datam, tag)
         el.text = metadata[tag] or None
@@ -204,7 +210,14 @@ def build_dump_xml(record: DocumentRecord, metadata_by_record: dict[int, dict[st
     # ET's own xml_declaration=True emits single-quoted attributes
     # ('<?xml version=\'1.0\'...'); every real production file uses double
     # quotes, so the declaration is written out by hand instead.
-    body = ET.tostring(root, encoding="unicode")
+    # short_empty_elements=False: the real dump always writes an explicit
+    # open+close pair for every tag, even a genuinely empty one (e.g. an
+    # UpdateDate that has never been resubmitted) - never a self-closing
+    # "<Tag />". The 43 extracted fields never actually hit this (a
+    # missing value already becomes the literal text "N.A", not emptiness
+    # - see _record_to_datam_element), so this only changes the
+    # metadata tags that can be genuinely blank.
+    body = ET.tostring(root, encoding="unicode", short_empty_elements=False)
     return f'<?xml version="1.0" encoding="utf-8"?>\n{body}'
 
 
@@ -296,3 +309,54 @@ def submit_document(record: DocumentRecord, submissions_dir: Path, db_path: Path
     xml_path = write_dump_xml_file(record, submissions_dir, metadata_by_record)
     row_count = write_dump_xml_db(record, db_path, metadata_by_record)
     return xml_path, row_count
+
+
+def build_combined_dump_xml(records: list[DocumentRecord], metadata_by_document: dict[str, dict[int, dict]]) -> str:
+    """Same element shape as build_dump_xml, but spanning every document
+    in a batch under ONE shared <doc> root - this is what a batch submit
+    (app/api/batches.py's submit_batch) uploads as the batch's single
+    combined export, matching the real legacy dump's own convention of
+    many <DataM> records in one file (see the module docstring)."""
+    root = ET.Element("doc")
+    for record in records:
+        metadata_by_record = metadata_by_document[record.document_id]
+        for entry in record.records:
+            root.append(_record_to_datam_element(record, entry, metadata_by_record[entry.record_index]))
+    ET.indent(root, space="  ")
+    # short_empty_elements=False: see build_dump_xml's identical comment -
+    # the real dump never self-closes an empty tag.
+    body = ET.tostring(root, encoding="unicode", short_empty_elements=False)
+    text = f'<?xml version="1.0" encoding="utf-8"?>\n{body}'
+    return text.replace("\n", "\r\n")
+
+
+def submit_batch_records(
+    records: list[DocumentRecord], submissions_dir: Path, db_path: Path
+) -> tuple[str, int]:
+    """Submits every document in a batch via the SAME per-document logic
+    submit_document already uses for each one individually (immutable
+    CreateDate, UpdateDate only on genuine change, one upsert per record
+    in submissions.db, and that document's own flat XML file on local
+    disk unchanged) - this does not reimplement any of that. It only
+    additionally combines every document's records into ONE XML string
+    spanning the whole batch, for upload to Azure Blob Storage as a
+    single combined export (see app/api/batches.py's submit_batch).
+
+    Safe to call again for the same batch: every per-document write below
+    is the same idempotent upsert submit_document already relies on, and
+    the combined XML text is deterministically rebuilt from current
+    approved data each time, not appended to - calling this twice with
+    unchanged data produces byte-identical output.
+
+    Returns the combined XML text (CRLF, ready to write/upload as bytes)
+    and the total record count across every document."""
+    metadata_by_document: dict[str, dict[int, dict]] = {}
+    for record in records:
+        metadata_by_record = _build_record_metadata(record, db_path)
+        metadata_by_document[record.document_id] = metadata_by_record
+        write_dump_xml_file(record, submissions_dir, metadata_by_record)
+        write_dump_xml_db(record, db_path, metadata_by_record)
+
+    combined_text = build_combined_dump_xml(records, metadata_by_document)
+    total_records = sum(len(r.records) for r in records)
+    return combined_text, total_records

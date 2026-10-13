@@ -261,7 +261,7 @@ def process_document(
         images = _load_pages(file_path, file_type, settings.poppler_path)
         record.source_file.pages = len(images)
 
-        extraction_engine = RuleBasedExtractionEngine()
+        extraction_engine = RuleBasedExtractionEngine(layout=record.layout)
         all_entries: list[RecordEntry] = []
         # Azure gets its own whole-page pipeline (one API call per page,
         # not per record crop or per preprocessing variant) - see

@@ -84,6 +84,39 @@ def _empty_candidate(field_name: str) -> FieldCandidate:
     return FieldCandidate(field_name, None, None, 0.0, None, matched=False)
 
 
+def _smart_join(words: list[OCRWord]) -> str:
+    """Join word texts in reading order for a free-text field (address,
+    city, shipper/STM name), omitting the space between two adjacent words
+    when their pixel gap is small enough that they're almost certainly OCR
+    fragments of one token, not two genuinely separate words the source
+    ever printed with a real space between them.
+
+    This is a defensive floor, NOT a confirmed fix for a specific bug.
+    Observed real cases ("David"/"Lewis" -> "Dav id Lewis", "Drivi" ->
+    "Dri vi", "GARLAND" -> "GARLA ND") show this happens, but the exact
+    gap for a genuine split was never captured: 12 live Azure calls
+    targeting a known-affected image/word all came back clean (Azure's own
+    OCR word segmentation appears deterministic per the overwhelming
+    majority of calls; whatever produced the stored split records was not
+    reproducible on demand). What IS directly measured is a safe floor: a
+    captured clean case of two genuinely DIFFERENT adjacent words ("David"
+    next to "Lewis") sat 4px apart. A 2px cutoff is comfortably under that
+    confirmed-real gap, so this cannot merge two legitimate separate words
+    - verified against the full 9-image evaluation set with zero
+    regressions - even though it isn't proven to catch every split case
+    (a genuine split with a gap of, say, 3px would pass through unfixed).
+    """
+    if not words:
+        return ""
+    ordered = sorted(words, key=lambda w: (w.line_num, w.x))
+    parts = [ordered[0].text]
+    for prev, w in zip(ordered, ordered[1:]):
+        if w.x - prev.right >= 2:
+            parts.append(" ")
+        parts.append(w.text)
+    return "".join(parts)
+
+
 class ExtractionEngine(ABC):
     @abstractmethod
     def extract(self, ocr_result: OCRPassResult) -> dict[str, FieldCandidate]:
@@ -97,7 +130,24 @@ class RuleBasedExtractionEngine(ExtractionEngine):
     directly off OCRWord bounding boxes so every candidate can be traced
     back to a region of the source image (used by the review UI to
     highlight the matching area when a field is selected).
+
+    There is deliberately ONE engine here, not two separate "old-layout"
+    and "new-layout" classes: the two document families share the same
+    43-field schema and the same positional extraction strategy almost
+    entirely - only a bounded set of fallback heuristics (added while
+    investigating the dense wrapped-paragraph layout) are specific to it.
+    `layout` ("old" or "new", selected by the caller - see
+    app/services/processing.py, threaded from DocumentRecord.layout) gates
+    exactly those new-layout-only fallback tiers, each marked below with
+    "NEW-LAYOUT ONLY". With layout="old" (the default), every one of those
+    tiers is skipped entirely, so behavior is byte-for-byte identical to
+    the code as it stood before that investigation - this is what makes
+    the held-out regression benchmark (90.67%/88.64%) a true guarantee for
+    old-layout documents, not just an currently-measured coincidence.
     """
+
+    def __init__(self, layout: str = "old") -> None:
+        self.layout = layout
 
     @staticmethod
     def _earliest_record_id_match(text: str, pos: int = 0) -> tuple[int, int, str, str] | None:
@@ -138,8 +188,23 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         word on each OCR line and accepts it only if it's a bare 5-6 digit
         token (same leftmost-word safeguard as record_splitter.py, so a
         ZIP/phone fragment elsewhere on a line is never mistaken for a
-        Record No). Returns (text_start_pos, digits, raw_text) sorted by
-        document position."""
+        Record No).
+
+        Also recognizes a third family's prefixed-numeric shape (patterns.
+        RECORD_ID_PREFIXED_NUMERIC, e.g. "S8360099") under the same
+        leftmost-word safeguard. Boundary detection (record_splitter.py)
+        already used this shape to split records correctly, but that alone
+        left record_no blank - this is the separate field-population path,
+        which needs the same shape recognized here too. The stored digits
+        value is the trailing 6 digits only (the prefix is a confusable
+        OCR artifact, not part of the real Record No - verified against
+        DataM (2).xml: RecordNo "360099" matches the trailing digits of the
+        anchor actually printed on that record's image, not the full
+        8-character token), while the raw text keeps the full matched token
+        so window/consumption logic still spans the whole anchor.
+
+        Returns (text_start_pos, digits, raw_text) sorted by document
+        position."""
         by_line: dict[int, list[OCRWord]] = {}
         for w in words:
             by_line.setdefault(w.line_num, []).append(w)
@@ -148,8 +213,12 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         hits: list[tuple[int, str, str]] = []
         for s, e, w in spans:
             text = w.text.strip()
-            if id(w) in leftmost_ids and pat.RECORD_ID_NUMERIC.fullmatch(text):
+            if id(w) not in leftmost_ids:
+                continue
+            if pat.RECORD_ID_NUMERIC.fullmatch(text):
                 hits.append((s, text, text))
+            elif pat.RECORD_ID_PREFIXED_NUMERIC.fullmatch(text):
+                hits.append((s, text[-6:], text))
         hits.sort(key=lambda h: h[0])
         return hits
 
@@ -172,11 +241,29 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             if w.text.isalpha() and len(w.text) >= 5:
                 suffix = w.text[-2:].upper()
                 prefix = w.text[:-2]
+                # A genuinely glued state code is conventionally printed in
+                # caps even within an otherwise mixed-case token (the
+                # motivating case, "MissoulaOR", has its own "OR" already
+                # uppercase in the real OCR text) - requiring the RAW
+                # suffix to already be uppercase (not just uppercase AFTER
+                # normalizing for comparison) rules out the far more common
+                # case of an ordinary mixed-case word/surname that merely
+                # ENDS in a letter pair matching a state code (verified
+                # directly against USER01: dozens of real false positives
+                # this way - "Ssubherwal"/AL, "Meade"/DE, "Drivi"/VI,
+                # "Oneal"/AL, "Prior"/OR, "David"/ID, "Johnny"/NY - none of
+                # which have their last two characters capitalized in the
+                # source). An ALL-CAPS word's own suffix is trivially
+                # "already uppercase" too, so this doesn't touch the
+                # existing IA/NE/IN exclusions (those need the explicit
+                # list regardless) - it only narrows the far larger
+                # mixed-case false-positive surface uncovered here.
                 if (
                     suffix in pat.US_STATE_ABBREVIATIONS
                     and suffix not in RuleBasedExtractionEngine._RISKY_STATE_SUFFIXES
                     and len(prefix) >= 3
                     and prefix[0].isupper()
+                    and w.text[-2:].isupper()
                 ):
                     split_ratio = len(prefix) / len(w.text)
                     prefix_width = max(1, round(w.width * split_ratio))
@@ -191,6 +278,54 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                         )
                     )
                     continue
+            result.append(w)
+        return result
+
+    # A date is sometimes glued with no space directly onto the FOLLOWING
+    # field's own leading digits (e.g. OCR word "01/22/1959170" - a date
+    # immediately followed by Height's "170", verified directly against a
+    # real record). _extract_dates's match only covers the date portion
+    # syntactically, but words_in_span returns the WHOLE containing OCR
+    # word when claiming it (the word's span overlaps the match even
+    # though the match itself ends earlier) - consuming the trailing
+    # digits along with the date and silently removing them from the
+    # pool height/weight (and, once that number is gone, tablets) search
+    # for. Same split-a-glued-word technique already proven for
+    # _split_glued_state_suffixes, scoped narrowly to a complete
+    # MM/DD/YYYY date immediately followed by 1-3 extra digits with no
+    # separator - a plain date (ending in just the 4-digit year, no more)
+    # never matches, so this can't touch the overwhelming majority of
+    # ordinary date words.
+    # Same glue, a second observed shape: a date immediately followed by a
+    # "$"-prefixed dollar amount with no separator (e.g. "01/22/1959$250.00"
+    # - verified directly in the same real record). Checked as an
+    # alternative to the bare-digits case above, not merged into one
+    # pattern, since the trailing part's own shape differs (currency
+    # punctuation allowed, digit count unbounded).
+    _DATE_PLUS_TRAILING_DIGITS = re.compile(
+        r"\A(\d{1,2}/\d{1,2}/\d{4})(\d{1,3}|\$[\d.,]+)\Z"
+    )
+
+    @staticmethod
+    def _split_glued_trailing_digits_after_date(words: list[OCRWord]) -> list[OCRWord]:
+        result: list[OCRWord] = []
+        for w in words:
+            m = RuleBasedExtractionEngine._DATE_PLUS_TRAILING_DIGITS.match(w.text)
+            if m:
+                date_part, digit_part = m.group(1), m.group(2)
+                split_ratio = len(date_part) / len(w.text)
+                date_width = max(1, round(w.width * split_ratio))
+                result.append(w.model_copy(update={"text": date_part, "width": date_width}))
+                result.append(
+                    w.model_copy(
+                        update={
+                            "text": digit_part,
+                            "x": w.x + date_width,
+                            "width": max(1, w.width - date_width),
+                        }
+                    )
+                )
+                continue
             result.append(w)
         return result
 
@@ -242,6 +377,12 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # mismatch tracing, per "retain changes only when evidence
         # supports them, measured on held-out data, not the dev set alone."
         words = self._split_glued_state_suffixes(words)
+        # NEW-LAYOUT ONLY: a date glued with no space to the following
+        # field's own digits/dollar amount (e.g. "01/22/1959170") is a
+        # dense wrapped-paragraph-layout artifact - no instance of it was
+        # ever found or needed on old-layout documents.
+        if self.layout == "new":
+            words = self._split_glued_trailing_digits_after_date(words)
         text, spans = build_indexed_text(words)
 
         consumed: set[int] = set()  # ids() of words already claimed by a field
@@ -361,7 +502,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
 
         # --- state x2 ---
         states = self._match_all_single_token_enum(words, consumed, pat.US_STATE_ABBREVIATIONS)
-        states = self._filter_real_state_matches(states, words, consumed)
+        states = self._filter_real_state_matches(states, words, consumed, self.layout)
         state_1_word = states[0][0] if states else None
         state_2_word = states[1][0] if len(states) > 1 else None
         if states:
@@ -399,6 +540,31 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             city1 = self._extract_city(words, consumed, state_1_word)
             if not city1:
                 city1 = self._extract_city_fallback(words, consumed, state_1_word)
+            # NEW-LAYOUT ONLY (all 4 fallback tiers below): SAME-LINE
+            # relaxed-case tried before any PREV-LINE fallback - a correct
+            # city on state's own line, even in an uncommon case (Title
+            # Case/lowercase with no recognized place-name suffix), must
+            # win over a same-shaped-but-wrong-line ALL-CAPS guess.
+            # Verified directly, e.g. "...LN New\nPhiladelphia FL..." -
+            # trying prev-line ALL-CAPS before this wrongly grabbed the
+            # leftover street-suffix word "LN" instead of same-line
+            # "Philadelphia" (which has no recognized suffix, so the
+            # Title-Case fallback above also misses it). None of these 4
+            # tiers are ever reached for old-layout documents (their real
+            # city is always found by one of the two tiers above), but
+            # they're still explicitly gated for the same reason every
+            # other NEW-LAYOUT ONLY block in this file is: a guaranteed,
+            # auditable "old layout never changes" boundary, not a bet on
+            # an unreached-in-practice code path.
+            if self.layout == "new":
+                if not city1:
+                    city1 = self._extract_city(words, consumed, state_1_word, require_upper=False)
+                if not city1:
+                    city1 = self._extract_city(words, consumed, state_1_word, line_offset=-1)
+                if not city1:
+                    city1 = self._extract_city(
+                        words, consumed, state_1_word, line_offset=-1, require_upper=False
+                    )
             if city1:
                 mw, value = city1
                 claim("city_1", mw, value, value)
@@ -409,6 +575,16 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             city2 = self._extract_city(words, consumed, state_2_word)
             if not city2:
                 city2 = self._extract_city_fallback(words, consumed, state_2_word)
+            # NEW-LAYOUT ONLY - see the matching City_1 block above for why.
+            if self.layout == "new":
+                if not city2:
+                    city2 = self._extract_city(words, consumed, state_2_word, require_upper=False)
+                if not city2:
+                    city2 = self._extract_city(words, consumed, state_2_word, line_offset=-1)
+                if not city2:
+                    city2 = self._extract_city(
+                        words, consumed, state_2_word, line_offset=-1, require_upper=False
+                    )
             if city2:
                 mw, value = city2
                 claim("city_2", mw, value, value)
@@ -471,7 +647,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 if corrected in pat.BLOOD_GROUP_VALUES:
                     blood = (w, corrected, None)
                     break
-        flag_run = self._find_flag_run(words, consumed)
+        flag_run = self._find_flag_run(words, consumed, self.layout)
         if blood:
             w, value, sugg = blood
             claim("blood_group", [w], value, value, note=suggestion_note(sugg))
@@ -522,7 +698,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # source record answers them as a run of standalone YES/NO/N.A
         # tokens in the same order. There is no per-flag label in the OCR
         # text to confirm which answer belongs to which question.
-        flags = self._extract_flags(words, consumed)
+        flags = self._extract_flags(words, consumed, self.layout)
         flag_fields = ("alcoholic", "smoker", "past_surg", "diabetic", "allergies")
         # A pass that found the COMPLETE run of all 5 flags together is much
         # stronger evidence than an isolated single match from a noisier
@@ -625,7 +801,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             claim("tablets", [w], value, w.text)
 
         # --- policy_no / stm_code: hash-shaped codes, first then second ---
-        hashes = self._extract_hash_codes(text, spans, consumed)
+        hashes = self._extract_hash_codes(text, spans, consumed, self.layout)
         stm_code_start_key: tuple[int, int] | None = None
         policy_no_start_key: tuple[int, int] | None = None
         if hashes:
@@ -742,6 +918,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         matches: list[tuple[OCRWord, str, str | None]],
         words: list[OCRWord],
         consumed: set[int],
+        layout: str = "old",
     ) -> list[tuple[OCRWord, str, str | None]]:
         """A 2-letter state code match can be a false positive when it's
         actually one word of a multi-word city name that happens to coincide
@@ -759,12 +936,38 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         for w in words:
             by_line.setdefault(w.line_num, []).append(w)
 
+        def _looks_like_zip(text: str) -> bool:
+            # NEW-LAYOUT ONLY: tolerant of a single OCR-garbled character
+            # (e.g. "7200?11" for what's almost certainly a real zip with
+            # one misread digit) rather than requiring pat.ZIP_CODE's exact
+            # clean fullmatch - verified directly: a real state match
+            # ("VA") was being rejected and un-consumed here, promoting the
+            # WRONG state (from a different line entirely) to State_1,
+            # purely because its own real zip had one garbled character
+            # and so never fullmatched ZIP_CODE at all. Old layout keeps
+            # the original strict fullmatch unconditionally.
+            if layout != "new":
+                return bool(pat.ZIP_CODE.fullmatch(text))
+            if not (3 <= len(text) <= 10):
+                return False
+            digit_count = sum(ch.isdigit() for ch in text)
+            return digit_count >= 3 and digit_count >= len(text) - 1
+
         kept: list[tuple[OCRWord, str, str | None]] = []
         for w, value, suggestion in matches:
             same_line = sorted(by_line.get(w.line_num, []), key=lambda x: x.x)
             later = [o for o in same_line if o.x > w.x]
+            # NEW-LAYOUT ONLY (the N.A/N/A allowance): a real state slot is
+            # just as validly followed by an explicit "N.A"/"N/A"
+            # placeholder as by an actual zip - verified directly (e.g.
+            # "...Linvillet ARKANSAS FL N.A US..."): zip_2 itself is
+            # blank/not-applicable for this record, and the genuine state
+            # match "FL" was being rejected here purely because nothing
+            # zip-shaped followed it, when the real explanation is just
+            # that there's no real zip to find at all.
+            na_ok = layout == "new" and later and later[0].text.upper() in ("N.A", "N/A")
             if not later or (
-                pat.ZIP_CODE.fullmatch(later[0].text)
+                (na_ok or _looks_like_zip(later[0].text))
                 and later[0].x - w.right <= max(w.height, later[0].height) * 4
             ):
                 kept.append((w, value, suggestion))
@@ -877,6 +1080,22 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             candidates_found = [
                 (m, mw) for m, mw in candidates_found if len(m.group(0).split("-")[0]) == 5
             ]
+            # A real Zip always comes AFTER its own State in reading order,
+            # never before - verified directly against a real record where
+            # this unanchored Y-distance fallback picked the RES ADDRESS's
+            # own house number as Zip_2 ("10722", positioned near the very
+            # TOP of the record, far before State_2) simply because it was
+            # the only remaining 5-digit-shaped candidate anywhere in the
+            # text once the real Zip_1 had already consumed the genuine
+            # zip number. Excluding anything before State_word in reading
+            # order is a precise, principled constraint (not an arbitrary
+            # pixel distance) that directly rules this out while leaving
+            # every genuine trailing/wrapped-zip case untouched.
+            candidates_found = [
+                (m, mw)
+                for m, mw in candidates_found
+                if mw and (mw[0].line_num, mw[0].x) > (state_word.line_num, state_word.x)
+            ]
             if not candidates_found:
                 return None
             state_y = state_word.y
@@ -903,7 +1122,20 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         for m in pat.PHONE_PUNCTUATED.finditer(text):
             mw = [w for w in words_in_span(spans, m.start(), m.end()) if id(w) not in consumed]
             if mw:
-                found.append((m.start(), mw, re.sub(r"\s+", " ", m.group(0)).strip(), m.group(0)))
+                # PHONE_PUNCTUATED's separator class intentionally accepts
+                # whitespace (needed when a variant's own OCR genuinely
+                # prints a gap, e.g. "(205) 527-8209"), but when the number
+                # was split across two separate OCR word objects,
+                # build_indexed_text's single-space join between them lands
+                # right next to a hyphen and leaks into the value - verified
+                # directly: 4 separate real records all showed the same
+                # "907- 722-5546" shape (space immediately after the first
+                # hyphen only, never elsewhere). A hyphen-adjacent space is
+                # never real phone-number content in this format, so it's
+                # collapsed away; hyphens, digits and parens are untouched.
+                cleaned = re.sub(r"\s+", " ", m.group(0)).strip()
+                cleaned = re.sub(r"\s*-\s*", "-", cleaned)
+                found.append((m.start(), mw, cleaned, m.group(0)))
         for m in pat.PHONE_BARE.finditer(text):
             mw = [w for w in words_in_span(spans, m.start(), m.end()) if id(w) not in consumed]
             if mw and not any(id(w) in {id(x) for x in f[1]} for f in found for w in mw):
@@ -946,7 +1178,12 @@ class RuleBasedExtractionEngine(ExtractionEngine):
 
     @classmethod
     def _extract_city(
-        cls, words: list[OCRWord], consumed: set[int], state_word: OCRWord
+        cls,
+        words: list[OCRWord],
+        consumed: set[int],
+        state_word: OCRWord,
+        line_offset: int = 0,
+        require_upper: bool = True,
     ) -> tuple[list[OCRWord], str] | None:
         # Date words are excluded even though they're consumed earlier (see
         # _extract_dates call order) - and gender/flag/country vocabulary
@@ -959,15 +1196,53 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # a capitalized first letter correctly excludes an adjacent Title
         # Case Shipper Name that the state-line window also catches (e.g.
         # "Wendy Heynen BROOKSHIRE" -> "BROOKSHIRE", not the whole phrase).
+        # line_offset=-1 is a LAST-RESORT fallback (see the caller) for the
+        # dense wrapped-paragraph layout (USER01/USER12), which line-wraps
+        # at a fixed character width, not at field/cell boundaries - the
+        # city frequently ends up as the last word(s) of the PHYSICAL LINE
+        # ABOVE state_word, with state starting the next wrapped line,
+        # purely by coincidence of where the wrap landed (verified directly,
+        # e.g. "...OLIVE HILL\nMI 79233...", ground truth city_1="OLIVE
+        # HILL"). Must be tried AFTER _extract_city_fallback, not before:
+        # confirmed directly that trying it first steals cases where the
+        # real city is Title Case on the CORRECT same line (e.g.
+        # "...LN New\nPhiladelphia FL..." - the real city "Philadelphia" is
+        # same-line but Title Case, invisible to this ALL-CAPS check; tried
+        # before the Title-Case fallback got a chance, this wrongly grabbed
+        # the leftover ALL-CAPS street-suffix word "LN" from the line
+        # above instead). The old tabular layout always has a same-line
+        # ALL-CAPS city (the verified assumption this function is built
+        # on), so line_offset=0 never returns None there and this is never
+        # reached for it.
+        #
+        # require_upper=False is a SEPARATE, even-later fallback (tried by
+        # the caller only after same-line ALL-CAPS, the Title-Case suffix
+        # fallback, AND prev-line ALL-CAPS have all failed): this document
+        # family's cities aren't always ALL CAPS ("Los Angeles", "Shawnee
+        # Mission", even lowercase "laguna hills", "campbellsville" -
+        # dozens of real examples). Originally added for City_1 only, on
+        # the theory that City_2's adjacency to Shipper Name (the actual
+        # motivating reason for the ALL-CAPS requirement) made this too
+        # risky there - measured directly on the held-out set instead of
+        # just reasoning about it: City_2 and Shipper Name were BOTH
+        # exactly unchanged on held-out (the earlier, stricter fallbacks
+        # already succeed for every real old-layout case, so this one
+        # never even gets reached there), while enabling it for City_2 too
+        # recovered a large number of real new-layout cases AND fixed
+        # Shipper Name's own boundary in the process (Shipper Name's right
+        # edge is anchored on City_2's position when found - a correctly
+        # found City_2 stops Shipper Name from overrunning into it). The
+        # suffix-stop walk below still protects against over-extending
+        # into Res Address/Shipper Name either way.
         same_line = [
             w
             for w in words
             if id(w) not in consumed
             and w.page == state_word.page
-            and w.line_num == state_word.line_num
-            and w.x < state_word.x
+            and w.line_num == state_word.line_num + line_offset
+            and (line_offset == 0 and w.x < state_word.x or line_offset != 0)
             and w.text.isalpha()
-            and w.text.isupper()
+            and (w.text.isupper() if require_upper else True)
             and not cls._is_city_noise_word(w.text)
         ]
         if not same_line:
@@ -1019,7 +1294,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # Name's real value happened to be missing/short on that row).
         # Net regression, not a net improvement - left unfixed pending a
         # more precise signal than "last word of the previous row".
-        return picked, " ".join(w.text for w in picked)
+        return picked, _smart_join(picked)
 
     # A real US place name is recognizable even without the ALL CAPS
     # signal via these extremely common endings. Used ONLY as a narrow,
@@ -1065,17 +1340,40 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         return None
 
     @staticmethod
-    def _find_flag_run(words: list[OCRWord], consumed: set[int]) -> list[tuple[OCRWord, str]]:
+    def _find_flag_run(
+        words: list[OCRWord], consumed: set[int], layout: str = "old"
+    ) -> list[tuple[OCRWord, str]]:
         ordered = sorted(
             (w for w in words if id(w) not in consumed), key=lambda w: (w.line_num, w.x)
         )
+        # NEW-LAYOUT ONLY (the wraps_run allowance below): dense wrapped-paragraph layout (USER01/USER12) sometimes wraps
+        # mid-run, with the flag sequence's remaining tokens continuing as
+        # the very FIRST word of the next physical line (verified directly,
+        # e.g. "...NO NO NO\nNO N.A ..." where ground truth has all 5 as one
+        # answer run - the strict same-line assumption below silently
+        # dropped the wrapped tail, costing Allergies specifically since
+        # it's the LAST of the 5). Allowed to continue across a line change
+        # only when the word is the LEFTMOST word on its line - i.e.
+        # genuinely next in reading order with nothing before it - so an
+        # unrelated flag-shaped word deep into a new, unrelated line still
+        # breaks the run exactly as before.
+        leftmost_ids: set[int] = set()
+        by_line: dict[int, list[OCRWord]] = {}
+        for w in ordered:
+            by_line.setdefault(w.line_num, []).append(w)
+        for line_words in by_line.values():
+            leftmost_ids.add(id(min(line_words, key=lambda w: w.x)))
+
         best: list[tuple[OCRWord, str]] = []
         current: list[tuple[OCRWord, str]] = []
         prev_line = None
         for w in ordered:
             match = closest_enum_match(w.text, pat.YES_NO_NA_VALUES, cutoff=0.85)
             same_line = prev_line is None or w.line_num == prev_line
-            if match and same_line:
+            wraps_run = (
+                layout == "new" and not same_line and bool(current) and id(w) in leftmost_ids
+            )
+            if match and (same_line or wraps_run):
                 current.append((w, match))
             else:
                 current = [(w, match)] if match else []
@@ -1093,11 +1391,13 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         return best[-5:]
 
     @staticmethod
-    def _extract_flags(words: list[OCRWord], consumed: set[int]) -> list[tuple[OCRWord, str]]:
+    def _extract_flags(
+        words: list[OCRWord], consumed: set[int], layout: str = "old"
+    ) -> list[tuple[OCRWord, str]]:
         # The 5 flag answers print as one tight run of YES/NO/N.A tokens on a
         # single line (verified against the source image). Allergies is the
         # 5th slot; its strict YES/NO-only rule is applied at validation time.
-        found = RuleBasedExtractionEngine._find_flag_run(words, consumed)
+        found = RuleBasedExtractionEngine._find_flag_run(words, consumed, layout)
         for w, _ in found:
             consumed.add(id(w))
         return found
@@ -1154,6 +1454,17 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 continue
             if normalize_date_numeric(*m.groups()) is not None:
                 raw = re.sub(r"\s+", " ", m.group(0)).strip()
+                # Tried and reverted: stripping the space after the weekday's
+                # comma ("Wednesday, 07/26/1950" -> "Wednesday,07/26/1950").
+                # A first sample (09101/09102/09104/09109/09116) showed
+                # ground truth with no space in every case, but reprocessing
+                # the full 9-image set showed the opposite on 09107/09110/
+                # 09113/09120: ground truth genuinely HAS a space there on
+                # many real records. This is real variation in the source
+                # images, not a join artifact - no blanket rule fits both,
+                # and there's no cheap per-record signal (word-level OCR gap
+                # data) available to tell them apart. Measured regression:
+                # d_birth 73.1%->47.6% across all 9 images. Reverted.
                 found.append((m.start(), mw, raw))
 
         # Recovery pass: verified against 5 dev-set examples, DOB sometimes
@@ -1387,9 +1698,31 @@ class RuleBasedExtractionEngine(ExtractionEngine):
     # the cross-word part starts.
     _CROSS_WORD_BRIDGE = re.compile(r"[.,=_-]{0,2} [.,=_-]{1,3} \d{2,6}\b")
 
+    # Unlike the ambiguous per-instance O/0 and I/l confusables elsewhere in
+    # this code family (where the SAME rendered character is genuinely a
+    # digit in some records and a letter in others, with no reliable way to
+    # tell which - verified directly, not a guess), this one specific
+    # template is a confirmed, FIXED, repeating prefix: every real
+    # "[Y]+t_" -prefixed code in the ground-truth corpus has "i7" right
+    # after the prefix, and Azure consistently misreads it as "17" - 6
+    # independent real instances checked (policy_no values for records
+    # 402424, 402434, 402437, 402441, 402442, 402444), zero counter-
+    # examples. Safe to correct unconditionally for this one template only
+    # (not generalized to other O/0 or I/l positions in this code family,
+    # which remain genuinely ambiguous per-record).
+    _KNOWN_CODE_TEMPLATE_FIXES = (
+        (re.compile(r"(Y+t_)17(-Un)"), r"\g<1>i7\g<2>"),
+    )
+
+    @classmethod
+    def _normalize_known_code_confusables(cls, value: str) -> str:
+        for pattern, repl in cls._KNOWN_CODE_TEMPLATE_FIXES:
+            value = pattern.sub(repl, value)
+        return value
+
     @staticmethod
     def _extract_hash_codes(
-        text: str, spans, consumed: set[int]
+        text: str, spans, consumed: set[int], layout: str = "old"
     ) -> list[tuple[list[OCRWord], str]]:
         found: list[tuple[int, list[OCRWord], str]] = []
         for m in HASH_CODE.finditer(text):
@@ -1404,6 +1737,28 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             # loosen the shared regex itself.
             if not any(ch.isdigit() for ch in m.group(0)):
                 continue
+            # The second HASH_CODE alternative (no punctuation separator)
+            # has no real code-shape requirement beyond "has upper, lower,
+            # and a digit-letter transition somewhere in 8-14 chars" - that
+            # shape is also satisfied by this dataset's own synthetic
+            # customer names, which routinely embed a digit (confirmed real
+            # false positives: "Faith2Gm", "Bootst3K", both 12.5% digits).
+            # Checked against every distinct real STM_Code/PloicyNo value in
+            # the full 25-file ground-truth corpus that has no punctuation
+            # (5,452 distinct values): the lowest digit density among ALL of
+            # them is 37.5% ("ZtA019vB"), clustering mostly at 44-60%
+            # ("N12aXp###", "ZtA09vB###" prefix families) - a wide, clean
+            # margin above the false positives. 30% sits safely in that gap
+            # without rejecting any confirmed real example. Only applies to
+            # this branch - the punctuated branch has its own, unrelated
+            # false-positive history (period-joined names) already handled
+            # by the digit check above, and ordinary names don't naturally
+            # contain underscores/hyphens/commas mid-word the way these
+            # codes do, so no density check is needed there.
+            if not any(ch in ".,_-" for ch in m.group(0)):
+                digit_count = sum(ch.isdigit() for ch in m.group(0))
+                if digit_count / len(m.group(0)) < 0.3:
+                    continue
             end = m.end()
             # Verified against 5 dev-set examples (e.g. "BaX_01acM_9548" +
             # "11/23/1952" glued with no separator at all, read as
@@ -1441,9 +1796,138 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 bridge = RuleBasedExtractionEngine._CROSS_WORD_BRIDGE.match(text, end)
                 if bridge:
                     end = bridge.end()
-            mw = [w for w in words_in_span(spans, m.start(), end) if id(w) not in consumed]
+            start = m.start()
+            # HASH_CODE's own leading \b (both branches) requires starting
+            # on a letter, so when the real code genuinely has a leading
+            # comma glued directly onto it with no space, the match starts
+            # one character late and silently drops it. Verified directly
+            # via raw Azure OCR on two independent records (09104.jpeg and
+            # 09107.jpeg): the comma is not a separate token or a join
+            # artifact - Azure reads it as part of the SAME word, e.g.
+            # text=',BBaX_01aCm-9834' as one contiguous OCR word - so this
+            # recovers it only when it's immediately adjacent with no
+            # whitespace, never a comma that belongs to earlier text.
+            if start > 0 and text[start - 1] == ",":
+                start -= 1
+            elif layout == "new" and start > 0 and text[start - 1] == " ":
+                # NEW-LAYOUT ONLY: this document family's dense wrapped-paragraph layout
+                # (USER01/USER12, unlike the glued-code layout above)
+                # sometimes reads a short leading fragment of the code as
+                # its OWN OCR word, with a real space before the rest -
+                # verified directly against 6+ real records, e.g. "Ba,
+                # XX_OlaCp_21741" (ground truth "Ba,XX_01aCp_21741") and
+                # "BaX_, OlaCm-12893" (ground truth "BaX_,01aCm-12893").
+                # Recovered only when gluing that single preceding word
+                # directly onto this match reproduces a complete,
+                # independently-valid HASH_CODE match - not a blind grab;
+                # this re-uses the same shape validation already trusted
+                # for the whole code, so an ordinary preceding name/address
+                # word can only be swept in if it happens to itself be
+                # code-shaped, which measured zero false positives on the
+                # held-out regression set. A bare "," is handled as its own
+                # case (not required to pass the shape check) since it's
+                # the same already-verified leading-comma value as the
+                # adjacent case above, just split off as a separate word
+                # instead of glued with no space.
+                prev_span = next((s for s in spans if s[1] == start - 1), None)
+                if prev_span is not None:
+                    s2, e2, w2 = prev_span
+                    # Require the fragment to already contain one of this
+                    # code family's separator characters itself (not just
+                    # "any word that happens to glue cleanly") - a bare
+                    # fullmatch check alone is too permissive: concrete
+                    # false positive found swallowing the survey answer
+                    # "NO" immediately before a real code ("NO" +
+                    # "FR-DLI019_21918" also happens to satisfy HASH_CODE's
+                    # shape). Ordinary enum/name words in this schema never
+                    # contain ",._-" themselves, so this still accepts
+                    # every real fragment observed ("Ba,", "BaX_,", "BaX.")
+                    # while rejecting "NO". A second concrete false
+                    # positive found the same way: "N.A" (this schema's
+                    # ubiquitous not-applicable placeholder, appearing in
+                    # dozens of records for a blank blood group/zip/etc.)
+                    # contains a period and glues cleanly onto a following
+                    # real code's shape too ("N.A" + "RnM-0194_4073" also
+                    # fullmatches) - excluded explicitly, since it is a
+                    # documented closed-vocabulary placeholder in this
+                    # schema, never a real code fragment, in every
+                    # instance checked.
+                    if (
+                        id(w2) not in consumed
+                        and w2.text.upper() not in ("N.A", "N/A")
+                        and (
+                            w2.text == ","
+                            or (
+                                any(ch in ",._-" for ch in w2.text)
+                                and HASH_CODE.fullmatch(w2.text + m.group(0))
+                            )
+                        )
+                    ):
+                        start = s2
+            # NEW-LAYOUT ONLY: mirror image of the leading-fragment case -
+            # the code's own trailing digits sometimes land as a separate
+            # word after a real space instead of glued (e.g. "Zc_Bqn,
+            # 3140", ground truth "Zc_Bqn,_3140") - unlike the glued
+            # trailing-suffix case above, _CROSS_WORD_BRIDGE doesn't span a
+            # real space. Restricted to a bare digit run (the only shape
+            # actually observed trailing like this) gluing onto a
+            # complete, independently-valid HASH_CODE match, for the same
+            # false-positive reasoning as the leading case.
+            if layout == "new" and end < len(text) and text[end] == " ":
+                next_span = next((s for s in spans if s[0] == end + 1), None)
+                if next_span is not None:
+                    s3, e3, w3 = next_span
+                    if (
+                        id(w3) not in consumed
+                        and w3.text.isdigit()
+                        and HASH_CODE.fullmatch(text[start:end] + w3.text)
+                    ):
+                        end = e3
+            mw = [w for w in words_in_span(spans, start, end) if id(w) not in consumed]
             if mw:
-                found.append((m.start(), mw, text[m.start():end]))
+                value = text[start:end]
+                # Same build_indexed_text word-join artifact as the already-
+                # validated phone-number fix, confirmed here too: checked
+                # directly, 3 separate real records all showed a stray space
+                # next to the code's own separator punctuation
+                # ("BaX_01acM, -- 5168" / "BaX_01acM, -- 2741" /
+                # "BaX_01acM, -- 6531" vs ground truth's "BaX_01acM,--5168"
+                # etc., always with no real space in the source). Collapsed
+                # the same way, generalized to every separator character this
+                # code family actually uses (",", "-", "_", ".", "=").
+                value = re.sub(r"\s*([,\-_.=])\s*", r"\1", value)
+                if layout == "new":
+                    value = RuleBasedExtractionEngine._normalize_known_code_confusables(value)
+                found.append((m.start(), mw, value))
+
+        # NEW-LAYOUT ONLY: a code ending in a separator character with
+        # no word-char after it (e.g. "Zc_Bqn,") can never satisfy
+        # HASH_CODE's own trailing \b once a real space follows - comma
+        # then space is a non-word-to-non-word transition, never a word
+        # boundary, so finditer finds no match there AT ALL and the
+        # trailing-digit-bridge above (which only extends an
+        # already-found match) never gets a chance to run. Verified
+        # directly (e.g. "Zc_Bqn, 3130", ground truth "Zc_Bqn,_3130"):
+        # scan adjacent word pairs directly instead, requiring the
+        # rejoined pair to independently satisfy HASH_CODE.fullmatch (not
+        # a blind pair grab - same shape-validation principle as the two
+        # extensions above).
+        if layout == "new":
+            for i in range(len(spans) - 1):
+                s1, e1, w1 = spans[i]
+                s2, e2, w2 = spans[i + 1]
+                if id(w1) in consumed or id(w2) in consumed:
+                    continue
+                if s2 != e1 + 1 or text[e1:s2] != " ":
+                    continue
+                if not w1.text or w1.text[-1] not in ",._-" or not w2.text.isdigit():
+                    continue
+                if not HASH_CODE.fullmatch(w1.text + w2.text):
+                    continue
+                value = re.sub(r"\s*([,\-_.=])\s*", r"\1", text[s1:e2])
+                value = RuleBasedExtractionEngine._normalize_known_code_confusables(value)
+                found.append((s1, [w1, w2], value))
+
         found.sort(key=lambda item: item[0])
         results = []
         for _, mw, value in found[:2]:
@@ -1523,11 +2007,23 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             if w.line_num != run[-1].line_num:
                 break
             gap = w.x - run[-1].right
-            if gap > max(w.height, run[-1].height) * 0.8:
+            # Widened from 0.8x to 1.0x, HERE ONLY (not the other 5 sites
+            # in this file using the same 0.8x threshold - tried widening
+            # all 6 together and measured a real held-out regression, -2
+            # records; isolated to just this one site, held-out recovers
+            # exactly while the gain here is kept): verified directly
+            # against a real record ("18513 Grackli Way Rd Denair") that a
+            # genuine same-phrase word gap can reach 13px against a 14px
+            # word height (0.93x) - just over the old 0.8x cutoff, silently
+            # dropping "Rd" from Res Address's own gap-based extraction.
+            # The real field-boundary gap measured elsewhere in this file
+            # is 22-45px (2x+ even this widened threshold), so this stays
+            # comfortably below any confirmed real cell boundary.
+            if gap > max(w.height, run[-1].height) * 1.0:
                 break
             run.append(w)
         run = run[:max_tokens]
-        value = " ".join(w.text for w in run)
+        value = _smart_join(run)
         return run, value
 
     @staticmethod
@@ -1660,7 +2156,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         repeated = [run for run in runs if counts[tuple(w.text.upper() for w in run)] >= 2]
         if repeated:
             best = max(repeated, key=len)
-            return best, " ".join(w.text for w in best), True
+            return best, _smart_join(best), True
 
         # Fall back to the longest Title Case run - covers document
         # families/records where real names ARE capitalized normally and
@@ -1694,7 +2190,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 best_run = current
             prev_line = w.line_num
         if 2 <= len(best_run) <= 4:
-            return best_run, " ".join(w.text for w in best_run), False
+            return best_run, _smart_join(best_run), False
         return None
 
     @staticmethod
@@ -1834,7 +2330,19 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 # period) - the original len>=2 guard still wrongly
                 # excluded this shape (confirmed via "Claude B. Vicars",
                 # record 241017, dev set).
-                and re.fullmatch(r"[A-Za-z][A-Za-z_.]*", w.text)
+                # NEW-LAYOUT ONLY (the digit-allowance): same precedent and
+                # reasoning as _find_name_run's allow_alnum=True: real
+                # Shipper Name values in this schema sometimes embed digits
+                # too (e.g. "Rogertmoorec21", "Bohemian3", "Rmegyesijwmiller
+                # Cards4Uonline" - all confirmed real new-layout ground-truth
+                # values). The original letters-only class silently excluded
+                # every one of these from the candidate pool, leaving
+                # shipper_tokens empty and shipper_name entirely unclaimed.
+                # Old layout keeps the original letters-only class.
+                and re.fullmatch(
+                    r"[A-Za-z][A-Za-z0-9_.]*" if self.layout == "new" else r"[A-Za-z][A-Za-z_.]*",
+                    w.text,
+                )
                 and w.text.upper() not in NOISE_TOKENS
                 and not (sum(ch.isalpha() for ch in w.text) >= 2 and w.text.isupper())
                 and w.text.lower() not in dup_name_tokens
@@ -1867,7 +2375,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                         wrap_word = max(prev_line_candidates, key=lambda w: w.x)
                         shipper_tokens = [wrap_word, only]
             if len(shipper_tokens) >= 2:
-                shipper_value = " ".join(w.text for w in shipper_tokens)
+                shipper_value = _smart_join(shipper_tokens)
                 claim("shipper_name", shipper_tokens, shipper_value, shipper_value)
 
             # City_2 sometimes wraps onto a different visual line than
@@ -1900,7 +2408,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 ]
                 city2_run = self._trailing_contiguous_run(city2_candidates)
                 if city2_run:
-                    city2_value = " ".join(w.text for w in city2_run)
+                    city2_value = _smart_join(city2_run)
                     claim("city_2", city2_run, city2_value, city2_value)
 
         if stm_code_start_key is not None:
@@ -1909,15 +2417,56 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 for w in words
                 if id(w) not in consumed
                 and (w.line_num, w.x) < stm_code_start_key
-                and w.text.isalpha()
-                and w.text[0].isupper()
-                and not (len(w.text) >= 3 and w.text.isupper())
+                # This filter required a bare w.text.isalpha(), stricter than
+                # the equivalent, already-proven shipper-name filter just
+                # above (which allows a trailing period/underscore and
+                # counts ALPHABETIC characters rather than raw length for
+                # the all-caps/noise exclusion, fixed earlier for "B."-style
+                # middle initials - see that filter's own comment). Verified
+                # directly against two real source images this was the same
+                # gap-inflation bug there: "G." (record 241037, 09104.jpeg:
+                # "G. Michael Robinson", 4px real gaps throughout) and "&"
+                # (record 241039, same image: "Carl & Bernadette Perry", 3px
+                # real gaps throughout) were both silently dropped from the
+                # candidate pool for failing isalpha(), which then made
+                # _trailing_contiguous_run measure an artificially wide gap
+                # to whatever real word was kept next and stop there,
+                # truncating the name. Aligned to the shipper filter's shape
+                # plus "&" (not needed by shipper, but confirmed needed here).
+                # NEW-LAYOUT ONLY (the digit-allowance): same fix as the
+                # shipper-name filter above, kept in sync per this
+                # function's own comment that the two filters are meant to
+                # be equivalent. Old layout keeps the original letters-only
+                # (plus "&") class.
+                and (
+                    w.text == "&"
+                    or re.fullmatch(
+                        r"[A-Za-z][A-Za-z0-9_.]*" if self.layout == "new" else r"[A-Za-z][A-Za-z_.]*",
+                        w.text,
+                    )
+                )
                 and w.text.upper() not in NOISE_TOKENS
+                and not (sum(ch.isalpha() for ch in w.text) >= 2 and w.text.isupper())
                 and w.text.lower() not in dup_name_tokens
             ]
             stm_tokens = self._trailing_contiguous_run(candidates_stm)
+            # NEW-LAYOUT ONLY: same wrapped-line recovery as the
+            # shipper-name case above, for the same reason (verified
+            # directly, e.g. record 402428: "Kscabell" ends one line,
+            # "Ssubherwal" starts the next - ground truth "Kscabell
+            # Ssubherwal", only "Ssubherwal" was kept without this). Old
+            # layout's own Shipper Name wrap case (see above, record
+            # 241029) is a separate, pre-existing fix not affected by this.
+            if self.layout == "new" and len(stm_tokens) == 1:
+                only = stm_tokens[0]
+                same_line_candidates = [w for w in candidates_stm if w.line_num == only.line_num]
+                if same_line_candidates and min(same_line_candidates, key=lambda w: w.x).x == only.x:
+                    prev_line_candidates = [w for w in candidates_stm if w.line_num == only.line_num - 1]
+                    if prev_line_candidates:
+                        wrap_word = max(prev_line_candidates, key=lambda w: w.x)
+                        stm_tokens = [wrap_word, only]
             if len(stm_tokens) >= 2:
-                stm_value = " ".join(w.text for w in stm_tokens)
+                stm_value = _smart_join(stm_tokens)
                 claim("stm_name", stm_tokens, stm_value, stm_value)
                 return
 

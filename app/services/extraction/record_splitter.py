@@ -42,6 +42,10 @@ def _find_anchor_words(words: list[OCRWord]) -> list[tuple[str, OCRWord]]:
       anywhere, so this shape is only accepted when the token is also the
       LEFTMOST word on its line - genuine record numbers lead the line,
       other numeric fields don't.
+    - a 2-character confusable prefix glued to 6 digits (patterns.
+      RECORD_ID_PREFIXED_NUMERIC, e.g. "S8360099"), used by a third
+      document family. Same leftmost-of-line safeguard as the plain-numeric
+      shape, for the same reason.
     """
     by_line: dict[tuple[int, int], list[OCRWord]] = {}
     for w in words:
@@ -59,6 +63,9 @@ def _find_anchor_words(words: list[OCRWord]) -> list[tuple[str, OCRWord]]:
             continue
         if id(w) in leftmost_ids and pat.RECORD_ID_NUMERIC.fullmatch(text):
             found.append((text, w))
+            continue
+        if id(w) in leftmost_ids and pat.RECORD_ID_PREFIXED_NUMERIC.fullmatch(text):
+            found.append((text.upper(), w))
     found.sort(key=lambda item: item[1].y)
     return found
 
@@ -112,7 +119,9 @@ def choose_reference_boundaries(
         clean_hits = [
             text
             for text, w in cluster
-            if pat.RECORD_ID.fullmatch(text) or pat.RECORD_ID_NUMERIC.fullmatch(text)
+            if pat.RECORD_ID.fullmatch(text)
+            or pat.RECORD_ID_NUMERIC.fullmatch(text)
+            or pat.RECORD_ID_PREFIXED_NUMERIC.fullmatch(text)
         ]
         hint = clean_hits[0] if clean_hits else cluster[0][0]
         starts.append((hint, y))
