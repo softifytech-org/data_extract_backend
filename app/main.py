@@ -1,6 +1,7 @@
 """FastAPI application entrypoint."""
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -20,6 +21,14 @@ logger = get_logger(__name__)
 
 settings = get_settings()
 _worker: BatchWorker | None = None
+
+# Harmless build-version marker - not a secret, just the commit this
+# running process was built from (see Dockerfile's GIT_SHA build-arg and
+# .github/workflows/publish-image.yml, which passes the real commit SHA
+# on every build). "unknown" means either a local dev run or an image
+# built without that workflow - a real, useful signal either way, not an
+# error to hide.
+_GIT_SHA = os.environ.get("GIT_SHA", "unknown")
 
 
 @asynccontextmanager
@@ -86,7 +95,7 @@ def health() -> dict:
     this must stay fast and always-200 if the process is running, so an
     orchestrator restarting on health-check failure can't mistake a slow
     database for a dead process."""
-    return {"status": "ok"}
+    return {"status": "ok", "build": _GIT_SHA}
 
 
 @app.get("/api/ready")

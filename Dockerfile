@@ -28,6 +28,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Harmless build-version marker, baked in at image-build time (not a
+# secret - just the commit this image was built from) so GET /api/health
+# can report exactly which code is actually running, instead of having to
+# infer it from behavior. The build (see .github/workflows/publish-image.yml)
+# passes the real commit SHA as a build-arg; a local `docker build` with
+# no --build-arg simply reports "unknown", which is also a useful signal
+# (it means the image wasn't built by that workflow).
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+
 # Azure App Service for Containers / Container Apps both inject the
 # listening port via $PORT (App Service defaults it to 8000 if unset;
 # Container Apps requires it to match the configured target port - set

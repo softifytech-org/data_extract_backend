@@ -31,3 +31,5 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: ghcr.io/softifytech-org/data_extract_backend:latest
+          build-args: |
+            GIT_SHA=${{ github.sha }}

@@ -69,6 +69,20 @@ def test_every_field_tag_present_in_order(repo, test_settings):
     assert tags == EXPECTED_TAGS
 
 
+def test_update_date_is_not_self_closing_in_raw_output(repo, test_settings):
+    """Calls the REAL production path (submit_document -> write_dump_xml_file
+    -> build_dump_xml), not a reimplemented snippet, and checks the raw text
+    written to disk, not a parsed ET tree (ET.fromstring/ET.parse silently
+    normalize '<UpdateDate/>' and '<UpdateDate></UpdateDate>' to the same
+    thing, which is exactly why this must be a raw-text check)."""
+    record = _build_record(repo, "DOC-FFFFFFFFFFFF")
+    xml_path, _ = submit_document(record, test_settings.submissions_dir, test_settings.submissions_db_path)
+    text = xml_path.read_bytes().decode("utf-8-sig")
+    assert "<UpdateDate></UpdateDate>" in text
+    assert "<UpdateDate/>" not in text
+    assert "<UpdateDate />" not in text
+
+
 def test_root_declaration_and_bom(repo, test_settings):
     record = _build_record(repo, "DOC-DDDDDDDDDDDD")
     xml_path, _ = submit_document(record, test_settings.submissions_dir, test_settings.submissions_db_path)
