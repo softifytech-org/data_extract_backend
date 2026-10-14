@@ -524,12 +524,15 @@ class RuleBasedExtractionEngine(ExtractionEngine):
 
         # --- phone x2: punctuated grammar first, then bare 10-digit ---
         phones = self._extract_phones(text, spans, consumed)
-        if phones:
+        if len(phones) >= 2:
             mw, value, raw = phones[0]
             claim("phno_1", mw, value, raw)
-        if len(phones) > 1:
             mw, value, raw = phones[1]
             claim("phno_2", mw, value, raw)
+        elif len(phones) == 1:
+            mw, value, raw = phones[0]
+            slot = self._assign_lone_phone_slot(mw[0], state_2_word)
+            claim(slot, mw, value, raw)
 
         # --- city x2: word(s) immediately before each matched state token ---
         # Extracted BEFORE Res Address on purpose: Res Address is then
@@ -1113,6 +1116,24 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # field's value; also stops zip_2 from stealing a word that
         # res_address would otherwise correctly claim later.
         return None
+
+    @staticmethod
+    def _assign_lone_phone_slot(phone_word: OCRWord, state_2_word: OCRWord | None) -> str:
+        """Bug fix: when exactly one phone-shaped match is found, it must
+        never default to Phone_1 just because it's the only match - if
+        Phone_1 genuinely isn't on the page (OCR/regex found nothing
+        there) but Phone_2 is, the one real match is Phone_2, not a
+        "shifted" Phone_1. FIELD_TO_DUMP_TAG's own schema order confirms
+        Phone_1 always precedes Country_1 (block 1) while Phone_2 always
+        follows Country_2 (block 2, which starts after State_2) - so a
+        lone match at or after State_2's own position is Phone_2. Falls
+        back to the original phno_1 default only when there's no State_2
+        anchor to compare against (unchanged behavior for that case)."""
+        is_phone_2 = (
+            state_2_word is not None
+            and (phone_word.line_num, phone_word.x) >= (state_2_word.line_num, state_2_word.x)
+        )
+        return "phno_2" if is_phone_2 else "phno_1"
 
     @staticmethod
     def _extract_phones(

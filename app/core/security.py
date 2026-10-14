@@ -43,13 +43,24 @@ def generate_document_id() -> str:
     return f"DOC-{uuid.uuid4().hex[:12].upper()}"
 
 
+# Only characters that are either control codes or genuinely illegal in a
+# Windows/Unix filename (a real uploaded file could never have had one of
+# these in its name to begin with, so replacing them loses no real
+# information). Everything else - parentheses, brackets, "&", "'", "+",
+# "#", "@", "%", "~", etc. - is meaningful, naturally-occurring filename
+# content (e.g. a duplicate-upload suffix like "scan (1).jpg") and must be
+# preserved exactly, since this value becomes <ImageName> in the legacy
+# XML dump and is the handoff key the team-lead app matches against.
+_FORBIDDEN_FILENAME_CHARS = re.compile(r'[\x00-\x1f\x7f<>:"/\\|?*]')
+
+
 def sanitize_original_filename(filename: str) -> str:
     """Produce a display-safe copy of the client filename for audit/logging only.
 
     This value is NEVER used to build a filesystem path - see safe_storage_path().
     """
     name = Path(filename).name  # strips any directory components / traversal segments
-    name = re.sub(r"[^A-Za-z0-9._\- ]", "_", name)
+    name = _FORBIDDEN_FILENAME_CHARS.sub("_", name)
     return name[:255] if name else "unnamed"
 
 

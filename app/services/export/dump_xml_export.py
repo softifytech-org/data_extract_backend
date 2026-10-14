@@ -90,23 +90,24 @@ DEFAULT_USER_ID = "midemo1"
 
 # The real dump's CreateDate format is NOT fixed across its whole history -
 # the same production system used "20 August 2026 11:22:55" (24h, no
-# weekday) for its August batches and "Monday, September 21, 2026
-# 6:37:33 PM" (12h + weekday) for its September batches, confirming the
-# legacy app's own date formatting changed over time (almost certainly a
-# locale/culture setting on whatever machine generated the dump, not
-# something this tool controls). Checked against the single most recent
-# real record across all 90,321 surveyed (2026-09-30 21:03:56, USER - 20)
-# to resolve which shape is current: it's the 12h+weekday style, confirming
-# this is the right one to use, not a guess.
+# weekday, both day and hour zero-padded) for most of its batches and a
+# weekday+12h style for a smaller fraction of them. An earlier pass here
+# picked the weekday+12h style by checking only the single most recent
+# record - that was overfit to one sample. Counted directly across all
+# 90,321 real records instead: 65,549 (72.6%) use the 24h no-weekday style
+# and 24,772 (27.4%) use weekday+12h, with no reliable signal (neither the
+# record's own date nor its source file) predicting which a given real
+# record would get - strongly suggesting it was a locale/culture setting
+# on whatever machine happened to generate that batch, not something this
+# tool should reproduce. The 24h no-weekday style is both the clear
+# majority and the one confirmed correct for this tool's own output, so it
+# is used unconditionally rather than guessed per record.
 #
-# That same check also showed neither the hour nor the day-of-month is
-# zero-padded in any of the 16,277 single-digit-hour / 3,946 single-digit-
-# day real examples checked ("9:03:56 PM", "September 1, 2026" - never
-# "09:03:56 PM" or "September 01, 2026"). Python's %I/%d always zero-pad
-# with no portable cross-platform way to turn that off (the no-pad strftime
-# flag differs between Windows and the Linux container this runs on in
-# production), so the string is built by hand below instead of via
-# strftime for the day/hour components.
+# Zero-padding, re-verified against the full 90,321-record set (not just a
+# handful): day-of-month IS zero-padded ("01 August 2026", never "1 August
+# 2026") and hour IS zero-padded in this 24h style ("00:12:15" at
+# midnight, never "0:12:15") - i.e. this is exactly Python's %d/%H/%B/%Y,
+# no hand-rolled padding needed.
 _IST = timezone(timedelta(hours=5, minutes=30))
 
 
@@ -114,12 +115,7 @@ def _format_dump_datetime(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     local = dt.astimezone(_IST)
-    hour12 = local.hour % 12 or 12
-    ampm = "AM" if local.hour < 12 else "PM"
-    return (
-        f"{local.strftime('%A')}, {local.strftime('%B')} {local.day}, {local.year} "
-        f"{hour12}:{local.minute:02d}:{local.second:02d} {ampm}"
-    )
+    return local.strftime("%d %B %Y %H:%M:%S")
 
 
 def _build_record_metadata(record: DocumentRecord, db_path: Path) -> dict[int, dict[str, str]]:
