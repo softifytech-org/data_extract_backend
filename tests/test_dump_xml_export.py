@@ -5,6 +5,7 @@ CreateDate immutability, and UpdateDate-only-on-genuine-edit."""
 from __future__ import annotations
 
 import copy
+import re
 from xml.etree import ElementTree as ET
 
 from app.services.export.dump_xml_export import (
@@ -125,6 +126,28 @@ def test_updatedate_set_only_on_genuine_edit(repo, test_settings):
     datam = root.find("DataM")
     assert datam.findtext("ResAddress") == "CHANGED VALUE"
     assert datam.findtext("UpdateDate").strip() != ""
+
+
+def test_update_date_format_matches_create_date_no_weekday_24h(repo, test_settings):
+    """A non-empty UpdateDate (set on genuine resubmit after an edit) must
+    match the same '%d %B %Y %H:%M:%S' shape as CreateDate - no weekday,
+    no comma, no AM/PM, zero-padded day and hour - since both are produced
+    by the same _format_dump_datetime(). Checked on raw text, not just
+    non-empty, since the earlier existing test only checked non-empty."""
+    record = _build_record(repo, "DOC-222222222222")
+    submit_document(record, test_settings.submissions_dir, test_settings.submissions_db_path)
+
+    edited = copy.deepcopy(record)
+    edited.records[0].fields["res_address"].value = "CHANGED VALUE 2"
+    xml_path, _ = submit_document(edited, test_settings.submissions_dir, test_settings.submissions_db_path)
+    text = xml_path.read_bytes().decode("utf-8-sig")
+
+    match = re.search(r"<UpdateDate>([^<]*)</UpdateDate>", text)
+    assert match is not None
+    update_date = match.group(1)
+    assert re.fullmatch(r"\d{2} [A-Za-z]+ \d{4} \d{2}:\d{2}:\d{2}", update_date), update_date
+    assert "," not in update_date
+    assert "AM" not in update_date and "PM" not in update_date
 
 
 def test_no_data_fabricated_for_none_values(repo, test_settings):
