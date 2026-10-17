@@ -33,6 +33,7 @@ from app.core.security import (
 from app.core.logging_config import get_logger
 from app.models.document import AuditInfo, DocumentRecord, DocumentStatus, SourceFileInfo
 from app.schemas.batch import (
+    BatchClearResponse,
     BatchDetail,
     BatchImageStatus,
     BatchSubmissionStatus,
@@ -199,20 +200,104 @@ def list_batches(db: AppDatabase = Depends(get_app_db)) -> list[BatchSummary]:
     ]
 
 
+_PROCESSED_STATUSES = ("completed", "needs_review")
+
+
 @router.get("/{batch_id}", response_model=BatchDetail)
-def get_batch(batch_id: str, db: AppDatabase = Depends(get_app_db)) -> BatchDetail:
+def get_batch(
+    batch_id: str, db: AppDatabase = Depends(get_app_db), repo: JsonDocumentRepository = Depends(get_repository)
+) -> BatchDetail:
     batch = _get_batch_or_404(db, batch_id)
     images = db.list_batch_images(batch_id)
+
+    def _enrich(i: dict) -> BatchImageStatus:
+        record_count = None
+        all_approved = None
+        # Only read the document's record file once OCR has actually
+        # produced records - reading it earlier would just report
+        # "0 records, not approved" for a still-queued image, which looks
+        # identical to a genuinely empty/broken one. Keeping both null
+        # until then is what lets the frontend tell "not reviewable yet"
+        # apart from "reviewed and has zero records".
+        if i["status"] in _PROCESSED_STATUSES:
+            record = repo.get(i["document_id"])
+            record_count = len(record.records)
+            all_approved = bool(record.records) and all(e.approved for e in record.records)
+        return BatchImageStatus(
+            position=i["position"], document_id=i["document_id"],
+            original_filename=i["original_filename"], status=i["status"], error=i["error"],
+            record_count=record_count, all_records_approved=all_approved,
+        )
+
     return BatchDetail(
         id=batch["id"], status=batch["status"], image_count=batch["image_count"],
         created_at=batch["created_at"], updated_at=batch["updated_at"],
-        images=[
-            BatchImageStatus(
-                position=i["position"], document_id=i["document_id"],
-                original_filename=i["original_filename"], status=i["status"], error=i["error"],
-            )
-            for i in images
-        ],
+        images=[_enrich(i) for i in images],
+    )
+
+
+@router.delete("/{batch_id}/images/{position}", response_model=BatchDetail)
+def remove_batch_image(
+    batch_id: str,
+    position: int,
+    db: AppDatabase = Depends(get_app_db),
+    repo: JsonDocumentRepository = Depends(get_repository),
+    file_store: FileStore = Depends(get_file_store),
+) -> BatchDetail:
+    """Removes one image from a batch before it's submitted - for a wrong
+    or unwanted upload the reviewer wants out of the batch entirely, as
+    opposed to clear_batch's whole-batch cleanup after a real submission
+    exists. Refuses once the batch has been submitted: at that point the
+    combined XML already reflects every current image, and editing batch
+    membership afterward would silently desync the two - clear the whole
+    batch and start over instead, the same as any other post-submission
+    change."""
+    _get_batch_or_404(db, batch_id)
+    if db.get_batch_submission(batch_id) is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="This batch has already been submitted - clear the batch instead of removing individual images.",
+        )
+    images = db.list_batch_images(batch_id)
+    target = next((i for i in images if i["position"] == position), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="No image at that position in this batch")
+
+    document_id = target["document_id"]
+    try:
+        record = repo.get(document_id)
+        file_store.delete_upload(record.source_file.stored_filename)
+    except Exception:  # noqa: BLE001 - best-effort; still remove the tracking rows below
+        logger.exception("Could not delete uploaded image for %s while removing it from batch %s", document_id, batch_id)
+    try:
+        repo.delete(document_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not delete stored record for %s while removing it from batch %s", document_id, batch_id)
+
+    db.remove_batch_image(batch_id, position)
+    db.recompute_batch_status(batch_id)
+    logger.info("Removed image at position %d (document %s) from batch %s", position, document_id, batch_id)
+
+    updated_batch = _get_batch_or_404(db, batch_id)
+    remaining = db.list_batch_images(batch_id)
+
+    def _enrich(i: dict) -> BatchImageStatus:
+        record_count = None
+        all_approved = None
+        if i["status"] in _PROCESSED_STATUSES:
+            rec = repo.get(i["document_id"])
+            record_count = len(rec.records)
+            all_approved = bool(rec.records) and all(e.approved for e in rec.records)
+        return BatchImageStatus(
+            position=i["position"], document_id=i["document_id"],
+            original_filename=i["original_filename"], status=i["status"], error=i["error"],
+            record_count=record_count, all_records_approved=all_approved,
+        )
+
+    return BatchDetail(
+        id=updated_batch["id"], status=updated_batch["status"], image_count=updated_batch["image_count"],
+        created_at=updated_batch["created_at"], updated_at=updated_batch["updated_at"],
+        images=[_enrich(i) for i in remaining],
     )
 
 
@@ -321,5 +406,68 @@ def download_batch_submission(
 
     return Response(
         content=data, media_type="application/xml",
-        headers={"Content-Disposition": f'attachment; filename="{batch_id}.xml"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{batch_id}.xml"',
+            # Same reasoning as documents.py's download_submission_xml: this
+            # URL's content is replaced wholesale on every resubmit, so it
+            # must never be cached by an intermediary between the client
+            # and this app.
+            "Cache-Control": "no-store",
+        },
     )
+
+
+@router.delete("/{batch_id}", response_model=BatchClearResponse)
+def clear_batch(
+    batch_id: str,
+    db: AppDatabase = Depends(get_app_db),
+    repo: JsonDocumentRepository = Depends(get_repository),
+    file_store: FileStore = Depends(get_file_store),
+) -> BatchClearResponse:
+    """Clears a batch's working data (uploaded images, per-document
+    records, batch/image tracking rows) once the reviewer is done with it.
+    Deliberately NOT a general "delete any batch" operation - only allowed
+    once the batch has a real, durably-stored submission (i.e. the
+    reviewer already generated and could download the combined XML), so
+    this can never destroy in-progress review work. The submitted XML
+    itself is NOT deleted - it's the durable deliverable a separate
+    downstream system depends on, re-downloadable later even after the
+    working batch is cleared; only db.delete_batch's row cleanup removes
+    the *tracking* row for it, not the actual blob in storage.
+
+    Best-effort per-image cleanup: a single image's upload or record
+    delete failing does not abort the rest - every failure is collected
+    and returned in `errors` rather than silently claiming full success,
+    and the batch's own DB rows are only removed once every image has at
+    least been attempted (never left half-cleared with no record of what
+    happened)."""
+    _get_batch_or_404(db, batch_id)
+    submission = db.get_batch_submission(batch_id)
+    if submission is None:
+        raise HTTPException(
+            status_code=400,
+            detail="This batch has not been submitted yet - submit and download its XML before clearing it.",
+        )
+
+    images = db.list_batch_images(batch_id)
+    errors: list[str] = []
+    cleared = 0
+    for img in images:
+        document_id = img["document_id"]
+        label = f"position {img['position'] + 1} ({img['original_filename']})"
+        try:
+            record = repo.get(document_id)
+            file_store.delete_upload(record.source_file.stored_filename)
+        except Exception as exc:  # noqa: BLE001 - best-effort; report, don't abort the rest
+            errors.append(f"{label}: could not delete uploaded image - {exc}")
+            continue
+        try:
+            repo.delete(document_id)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{label}: could not delete stored record - {exc}")
+            continue
+        cleared += 1
+
+    db.delete_batch(batch_id)
+    logger.info("Batch %s cleared (%d image(s), %d error(s))", batch_id, cleared, len(errors))
+    return BatchClearResponse(batch_id=batch_id, images_cleared=cleared, errors=errors)

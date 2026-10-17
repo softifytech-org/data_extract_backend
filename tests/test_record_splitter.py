@@ -95,3 +95,89 @@ def test_choose_reference_boundaries_splits_two_adjacent_records():
     second_slice = [w for w in words if boundaries[1].y_start <= w.y < boundaries[1].y_end]
     assert {w.text for w in first_slice} == {"S8360099", "Customer"}
     assert {w.text for w in second_slice} == {"S8360100", "Customer"}
+
+
+# --- RECORD_ID_NUMERIC: 5/7/8-digit shapes require a name+email companion
+# on the same line (see patterns.py's RECORD_ID_NUMERIC and
+# patterns.looks_like_name_start/line_has_email for the full rationale).
+# The exact-6-digit shape is unchanged and needs no companion at all.
+
+def _record_line(id_text, *companions, line_num=20, y=400):
+    """A record-ID word followed by companion words on the same physical
+    line, spaced out like a real OCR'd row."""
+    words = [_word(id_text, x=0, width=70, line_num=line_num, y=y)]
+    x = 80
+    for c in companions:
+        width = max(40, len(c) * 7)
+        words.append(_word(c, x=x, width=width, line_num=line_num, y=y))
+        x += width + 10
+    return words
+
+
+def test_five_digit_record_id_accepted_with_name_and_email_companions():
+    """Real shape from the "100526" dataset (USER 25): a genuine 5-digit
+    Record No followed by a two-word name and an email."""
+    words = _record_line("22491", "Krzychika", "Dipen.Maun", "akire@adelphia.net")
+    assert [t for t, _ in _find_anchor_words(words)] == ["22491"]
+
+
+def test_eight_digit_plain_record_id_accepted_with_name_and_email_companions():
+    """Real shape from the "100526" dataset (USER 13): an 8-digit Record
+    No (not the letter-prefixed shape) followed by name and email."""
+    words = _record_line("94401303", "Mblaney", "Luckybagcw2Simpson", "hebdrbill57noi@yahoo.com")
+    assert [t for t, _ in _find_anchor_words(words)] == ["94401303"]
+
+
+def test_six_digit_record_id_accepted_without_any_companion_unchanged():
+    """The original, most-verified shape needs no companion check at all -
+    must still match bare, exactly as before this change."""
+    words = [_word("405400", x=0, width=50, line_num=0, y=0)]
+    assert [t for t, _ in _find_anchor_words(words)] == ["405400"]
+
+
+def test_five_digit_bare_zip_alone_on_line_still_rejected():
+    """The historical false positive this safeguard exists for: a wrapped
+    5-digit ZIP with nothing else on its line."""
+    words = [_word("11725", x=0, width=50, line_num=0, y=0)]
+    assert _find_anchor_words(words) == []
+
+
+def test_five_digit_zip_followed_by_country_code_rejected():
+    words = _record_line("11725", "US")
+    assert _find_anchor_words(words) == []
+
+
+def test_five_digit_zip_followed_by_phone_digits_rejected():
+    words = _record_line("94316", "8640622926")
+    assert _find_anchor_words(words) == []
+
+
+def test_five_digit_wrapped_field_with_garbled_companion_rejected():
+    """Confirmed real false positive found during evaluation: a wrapped
+    Zip_2 followed by garbled OCR noise ("USTN") that passes a naive
+    alphabetic-word check must still be rejected because no email appears
+    anywhere on the line - this is why the email check exists in addition
+    to the name-shape check, not instead of it."""
+    words = _record_line("55060", "USTN", "Pi0.3-Ur_6780")
+    assert _find_anchor_words(words) == []
+
+
+def test_five_digit_record_id_rejected_when_companion_is_a_day_name():
+    """Confirmed real false positive found during evaluation: "13284
+    Monday, 07/31/1939..." is a wrapped mid-record field, not a record
+    start. Also confirms punctuation is stripped before the closed-
+    vocabulary check - "Monday," with its trailing comma must still be
+    excluded the same as a bare "Monday" would be."""
+    words = _record_line("13284", "Monday,", "07/31/1939")
+    assert _find_anchor_words(words) == []
+
+
+def test_eight_digit_token_matching_both_shapes_uses_prefixed_path():
+    """"58360441" is shape-identical to BOTH RECORD_ID_NUMERIC (8 plain
+    digits) and RECORD_ID_PREFIXED_NUMERIC ("5"+"8"+6 digits). It must
+    still be recognized via the already-proven prefixed path even with no
+    name/email companion on its line - the newer, stricter plain-numeric
+    requirements must never suppress an anchor the prefixed shape alone
+    would already have found."""
+    words = [_word("58360441", x=0, width=70, line_num=0, y=0)]
+    assert [t for t, _ in _find_anchor_words(words)] == ["58360441"]

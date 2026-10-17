@@ -98,3 +98,54 @@ def test_list_batches_returns_every_batch_not_scoped_to_a_caller(client):
 def test_batch_enqueues_one_job_per_image(client, app_db):
     client.post("/api/batches", files=_files(3))
     assert app_db.queue_depth() == {"pending": 3}
+
+
+# --- GET /api/batches/{id}: per-image record_count/all_records_approved ---
+
+def test_batch_detail_reports_null_progress_before_processing(client):
+    """An image still queued has no records yet - must be null, not 0/false,
+    so the frontend can tell "not reviewable yet" apart from "reviewed with
+    zero records"."""
+    resp = client.post("/api/batches", files=_files(1))
+    batch_id = resp.json()["batch_id"]
+    detail = client.get(f"/api/batches/{batch_id}").json()
+    img = detail["images"][0]
+    assert img["record_count"] is None
+    assert img["all_records_approved"] is None
+
+
+def test_batch_detail_reports_record_count_and_approval_once_processed(client, repo, app_db):
+    from app.models.document import (
+        DataType, DocumentStatus, ExtractedField, FieldSource, FieldStatus, RecordEntry,
+    )
+
+    resp = client.post("/api/batches", files=_files(1))
+    batch_id = resp.json()["batch_id"]
+    document_id = client.get(f"/api/batches/{batch_id}").json()["images"][0]["document_id"]
+
+    record = repo.get(document_id)
+    record.status = DocumentStatus.PROCESSED
+    record.records = [
+        RecordEntry(
+            record_index=1, page=1,
+            fields={"record_no": ExtractedField(
+                field_name="record_no", label="Record No", value="241001",
+                data_type=DataType.TEXT, confidence=99.0, status=FieldStatus.VERIFIED, source=FieldSource.OCR,
+            )},
+            approved=False,
+        ),
+        RecordEntry(record_index=2, page=1, fields={}, approved=True),
+    ]
+    repo.save(record)
+    app_db.update_batch_image_status(batch_id, 0, "completed")
+    app_db.recompute_batch_status(batch_id)
+
+    detail = client.get(f"/api/batches/{batch_id}").json()
+    img = detail["images"][0]
+    assert img["record_count"] == 2
+    assert img["all_records_approved"] is False  # one of the two records is still unapproved
+
+    record.records[0].approved = True
+    repo.save(record)
+    detail = client.get(f"/api/batches/{batch_id}").json()
+    assert detail["images"][0]["all_records_approved"] is True

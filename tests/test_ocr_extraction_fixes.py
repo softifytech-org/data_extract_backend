@@ -151,6 +151,72 @@ def test_numeric_record_ids_prefixed_shape_rejects_zip_and_dollar_lookalikes():
     assert _run_numeric_record_ids([_word("799.5670", x=0, width=80)]) == []
 
 
+# --- _find_numeric_record_ids: RECORD_ID_NUMERIC's 5/7/8-digit shapes
+# require a name+email companion on the same line, same as
+# record_splitter.py's _find_anchor_words (this is the separate record_no
+# FIELD-population path, not boundary detection - see patterns.py's
+# looks_like_name_start/line_has_email for the shared logic). The
+# exact-6-digit shape is unchanged and needs no companion at all.
+
+def _record_line(id_text, *companions, line_num=0):
+    words = [_word(id_text, x=0, width=70, line_num=line_num)]
+    x = 80
+    for c in companions:
+        width = max(40, len(c) * 7)
+        words.append(_word(c, x=x, width=width, line_num=line_num))
+        x += width + 10
+    return words
+
+
+def test_numeric_record_ids_five_digit_accepted_with_name_and_email_companions():
+    """Real shape from the "100526" dataset (USER 25)."""
+    words = _record_line("22491", "Krzychika", "Dipen.Maun", "akire@adelphia.net")
+    hits = _run_numeric_record_ids(words)
+    assert [h[1] for h in hits] == ["22491"]
+
+
+def test_numeric_record_ids_eight_digit_plain_accepted_with_name_and_email_companions():
+    """Real shape from the "100526" dataset (USER 13) - an 8-digit plain
+    Record No, distinct from the letter-prefixed 8-character shape."""
+    words = _record_line("94401303", "Mblaney", "Luckybagcw2Simpson", "hebdrbill57noi@yahoo.com")
+    hits = _run_numeric_record_ids(words)
+    assert [h[1] for h in hits] == ["94401303"]
+
+
+def test_numeric_record_ids_six_digit_unchanged_no_companion_needed():
+    hits = _run_numeric_record_ids([_word("241001", x=0, width=50, line_num=0)])
+    assert [h[1] for h in hits] == ["241001"]
+
+
+def test_numeric_record_ids_five_digit_zip_rejected_without_companions():
+    assert _run_numeric_record_ids([_word("11725", x=0, width=50, line_num=0)]) == []
+
+
+def test_numeric_record_ids_five_digit_zip_rejected_with_country_companion():
+    words = _record_line("11725", "US")
+    assert _run_numeric_record_ids(words) == []
+
+
+def test_numeric_record_ids_five_digit_rejected_when_companion_is_a_day_name():
+    """Mirrors the real false positive found during evaluation: "13284
+    Monday, 07/31/1939..." is a wrapped mid-record field, not a Record No."""
+    words = _record_line("13284", "Monday,", "07/31/1939")
+    assert _run_numeric_record_ids(words) == []
+
+
+def test_numeric_record_ids_eight_digit_prefix_overlap_uses_trailing_six_digits():
+    """"58360441" matches both RECORD_ID_NUMERIC (8 plain digits) and
+    RECORD_ID_PREFIXED_NUMERIC ("5"+"8"+6 digits). It must still take the
+    already-proven prefixed path (trailing-6-digit stored value) even with
+    no name/email companion on its line - the newer plain-numeric
+    requirements must never suppress an anchor the prefixed shape alone
+    would already have found."""
+    hits = _run_numeric_record_ids([_word("58360441", x=0, width=70, line_num=0)])
+    assert len(hits) == 1
+    assert hits[0][1] == "360441"
+    assert hits[0][2] == "58360441"
+
+
 def test_numeric_record_ids_plain_and_prefixed_shapes_coexist_sorted_by_position():
     """Both numeric record-ID shapes are distinct document families that
     never co-occur on a real page, but the function must not special-case

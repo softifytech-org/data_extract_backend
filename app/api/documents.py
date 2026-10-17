@@ -662,7 +662,18 @@ def download_submission_xml(
             ) from exc
         return Response(
             content=data, media_type="application/xml",
-            headers={"Content-Disposition": f'attachment; filename="{document_id}_submission.xml"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="{document_id}_submission.xml"',
+                # This document's submission XML is replaced wholesale on
+                # every resubmit (same storage key, overwritten - see
+                # FileStore.save_xml) - without an explicit no-store, any
+                # intermediary between the client and this app (a CDN,
+                # reverse proxy, or corporate/ISP cache) is free to serve a
+                # stale cached copy of this exact URL by default, since a
+                # plain 200 with no cache header gives it nothing telling
+                # it not to.
+                "Cache-Control": "no-store",
+            },
         )
     # Fallback for a document submitted before this durable-storage tracking
     # existed (an older local-only submission row with no document_submissions
@@ -670,4 +681,7 @@ def download_submission_xml(
     path = settings.submissions_dir / f"{document_id}.xml"
     if not path.exists():
         raise HTTPException(status_code=404, detail="This document has not been submitted yet")
-    return FileResponse(path=path, filename=f"{document_id}_submission.xml", media_type="application/xml")
+    return FileResponse(
+        path=path, filename=f"{document_id}_submission.xml", media_type="application/xml",
+        headers={"Cache-Control": "no-store"},
+    )

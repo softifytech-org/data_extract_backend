@@ -11,6 +11,19 @@ class BatchImageStatus(BaseModel):
     original_filename: str
     status: str
     error: str | None = None
+    # Populated only once the document has produced records (status
+    # "completed"/"needs_review") - null before that, not 0, so the
+    # frontend can tell "not processed yet" apart from "processed with
+    # zero records". Lets the batch screen show real review progress
+    # ("12 of 25 images reviewed") without a separate round trip per image.
+    record_count: int | None = None
+    all_records_approved: bool | None = None
+
+
+class BatchClearResponse(BaseModel):
+    batch_id: str
+    images_cleared: int
+    errors: list[str] = []
 
 
 class BatchSummary(BaseModel):

@@ -226,11 +226,34 @@ class AppDatabase:
                 (status, error, batch_id, position),
             )
 
+    def remove_batch_image(self, batch_id: str, position: int) -> None:
+        """Removes one image from a batch that hasn't been submitted yet
+        (see app/api/batches.py's remove_batch_image endpoint, which
+        refuses to call this once a submission exists). Deliberately does
+        NOT renumber the remaining images' `position` values - a gap in
+        position numbers is harmless (list_batch_images still returns them
+        correctly ordered; the frontend numbers rows by their position in
+        that list, not by the raw position value), and renumbering would
+        touch every row after the removed one for no real benefit.
+        image_count is decremented to match what's actually left, and the
+        batch's own status is left for the caller to recompute (mirrors
+        update_batch_image_status, which does the same)."""
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM batch_images WHERE batch_id = ? AND position = ?", (batch_id, position)
+            )
+            conn.execute(
+                "UPDATE batches SET image_count = image_count - 1, updated_at = ? WHERE id = ?",
+                (_now_iso(), batch_id),
+            )
+
     def delete_batch(self, batch_id: str) -> None:
-        """Used only to roll back a batch create that failed partway
-        through storing its files (see app/api/batches.py) - never called
-        on a successfully created batch, so this is not a general
-        "delete my data" operation."""
+        """Two legitimate callers (see app/api/batches.py): rolling back a
+        batch create that failed partway through storing its files, and
+        clear_batch's explicit, user-confirmed cleanup of a batch that has
+        already been submitted and downloaded. Neither leaves this as a
+        general "delete any batch anytime" operation - clear_batch itself
+        refuses to run unless a real submission already exists."""
         with self._connect() as conn:
             conn.execute("DELETE FROM batch_images WHERE batch_id = ?", (batch_id,))
             conn.execute("DELETE FROM batch_submissions WHERE batch_id = ?", (batch_id,))

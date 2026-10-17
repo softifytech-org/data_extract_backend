@@ -32,20 +32,34 @@ class RecordBoundary:
 
 def _find_anchor_words(words: list[OCRWord]) -> list[tuple[str, OCRWord]]:
     """Every word that looks like the SHAPE of a record ID, sorted top to
-    bottom. Two distinct shapes are recognized (see patterns.py):
+    bottom. Three distinct shapes are recognized (see patterns.py):
     - the alphanumeric "MI296T23" shape (patterns.RECORD_ID_ANCHOR,
       deliberately tolerant of badly-misread leading letters - this only
       needs to locate where each record starts, not read the ID correctly).
-    - a plain 5-6 digit number (patterns.RECORD_ID_NUMERIC), used by a
-      different document family in this same schema. Bare digits are too
-      easy to confuse with a ZIP/phone/other numeric field if matched
-      anywhere, so this shape is only accepted when the token is also the
-      LEFTMOST word on its line - genuine record numbers lead the line,
-      other numeric fields don't.
+    - a plain 5-8 digit number (patterns.RECORD_ID_NUMERIC), used by other
+      document families in this same schema. Bare digits are too easy to
+      confuse with a ZIP/phone/other numeric field if matched anywhere, so
+      this shape is only accepted when the token is also the LEFTMOST word
+      on its line - genuine record numbers lead the line, other numeric
+      fields don't. For exactly 6 digits (the original, most-verified
+      shape) that is the only requirement, unchanged from before. For any
+      other length (5, 7 or 8 digits - newer document families), a bare
+      digit run is shape-identical to a wrapped ZIP/other numeric field
+      that happens to land leftmost on its own line, so two additional,
+      content-based checks are required: a name-shaped word immediately
+      after it on the same line, AND an email address somewhere later on
+      that same line - the structural signature of a genuine record start,
+      not just its digit count. See patterns.looks_like_name_start/
+      patterns.line_has_email for the evidence behind each check (shared
+      with extraction/engine.py's _find_numeric_record_ids, which needs
+      the identical disambiguation for the same reason).
     - a 2-character confusable prefix glued to 6 digits (patterns.
       RECORD_ID_PREFIXED_NUMERIC, e.g. "S8360099"), used by a third
       document family. Same leftmost-of-line safeguard as the plain-numeric
-      shape, for the same reason.
+      shape, for the same reason. Checked BEFORE the plain-numeric shape so
+      an 8-digit token that also fits this more specific shape (e.g.
+      "58360441") is never suppressed by the plain-numeric path's extra
+      requirements.
     """
     by_line: dict[tuple[int, int], list[OCRWord]] = {}
     for w in words:
@@ -61,11 +75,18 @@ def _find_anchor_words(words: list[OCRWord]) -> list[tuple[str, OCRWord]]:
         if m:
             found.append((m.group(0).upper(), w))
             continue
-        if id(w) in leftmost_ids and pat.RECORD_ID_NUMERIC.fullmatch(text):
-            found.append((text, w))
-            continue
         if id(w) in leftmost_ids and pat.RECORD_ID_PREFIXED_NUMERIC.fullmatch(text):
             found.append((text.upper(), w))
+            continue
+        if id(w) in leftmost_ids and pat.RECORD_ID_NUMERIC.fullmatch(text):
+            if len(text) == 6:
+                found.append((text, w))
+                continue
+            line_words = sorted(by_line[(w.page, w.line_num)], key=lambda x: x.x)
+            after = [lw for lw in line_words if lw.x > w.x]
+            if after and pat.looks_like_name_start(after[0].text) and pat.line_has_email(line_words):
+                found.append((text, w))
+            continue
     found.sort(key=lambda item: item[1].y)
     return found
 

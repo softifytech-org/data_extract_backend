@@ -41,12 +41,26 @@ RECORD_ID_ANCHOR = re.compile(
 # turned out to be specific to one stress-test file, not the general case.
 # Required to be the entire token (fullmatch, not search) since a bare run
 # of digits is otherwise too easy to confuse with a ZIP/phone/other numeric
-# field if only matched as a substring. Pinned to exactly 6 digits rather
-# than BN_Workflow's full "5 or 6" range: verified directly against a real
-# multi-record page that a wrapped line starting with a 5-digit ZIP (e.g.
-# "11725") is otherwise indistinguishable from a genuine 5-digit Record No
-# by shape alone, and every real Record No seen in this family is 6 digits.
-RECORD_ID_NUMERIC = re.compile(r"\A\d{6}\Z")
+# field if only matched as a substring.
+#
+# Widened from an earlier exact-6-digit pin to 5-8 digits: a newer real
+# dataset (the "100526" batch) genuinely uses 5-digit (e.g. "22491") and
+# 8-digit (e.g. "94401303") Record Nos for several users, which the old
+# exact-6 pin rejected outright ("No record identifiers could be found").
+# The original 6-digit pin existed specifically because a bare 5-digit
+# match is shape-identical to a wrapped ZIP that lands leftmost on its own
+# line (e.g. "11725") - shape alone can't tell them apart. That
+# disambiguation is NOT done here by digit count; see record_splitter.py's
+# _find_anchor_words, which requires a non-6-digit match to also have a
+# name-shaped word immediately after AND an email address later on the
+# SAME line before accepting it - the structural signature of a genuine
+# record-start line, confirmed present on every real record line
+# inspected (both this new dataset and the original held-out/USER01/
+# USER12 corpus) and absent from the historical wrapped-ZIP false
+# positive, which was re-verified to still correctly reject under the new
+# logic. The 6-digit case itself is unchanged/ungated - zero new risk to
+# the already-proven majority of real data.
+RECORD_ID_NUMERIC = re.compile(r"\A\d{5,8}\Z")
 
 # A third document family prints Record No as a 2-character letter prefix
 # glued to a 6-digit number (e.g. "S8360099"), where the real stored value
@@ -220,3 +234,42 @@ DRUG_NAMES = {
 }
 
 COUNTRY_VALUES = {"US", "USA"}
+
+# Content-based disambiguation for RECORD_ID_NUMERIC's non-6-digit shapes
+# (5, 7, 8 digits) - shared by record_splitter.py (record-boundary
+# detection) and extraction/engine.py's _find_numeric_record_ids (the
+# record_no FIELD-population path), which both need the identical check so
+# a wrapped ZIP/other numeric field can't be mistaken for a Record No by
+# either consumer. See RECORD_ID_NUMERIC's own comment above for the full
+# history of why this exists - shape (digit count) alone can't tell a
+# genuine Record No from a wrapped field that happens to land leftmost on
+# its own line at the same length.
+_NON_NAME_VOCAB = COUNTRY_VALUES | GENDER_VALUES | US_STATE_ABBREVIATIONS | DAY_MONTH_NAMES
+
+
+def looks_like_name_start(text: str) -> bool:
+    letters = "".join(c for c in text if c.isalpha())
+    if len(letters) < 3:
+        return False
+    # Strip surrounding punctuation before the vocab check - "Monday,"
+    # (e.g. a wrapped field reading "13284 Monday, 07/31/1939...") must be
+    # excluded the same as a bare "Monday" would be; comparing the raw
+    # text with its comma still attached would silently miss this -
+    # confirmed as a real false positive during evaluation before this
+    # strip was added.
+    stripped = text.strip(".,;:!?()[]{}\"'").upper()
+    return stripped not in _NON_NAME_VOCAB
+
+
+def line_has_email(line_words) -> bool:
+    """A genuine record-start line carries a CustomerName/ShipperName AND
+    an email address shortly after the ID, confirmed present on every real
+    record-start line inspected (both a newer 5/8-digit-ID dataset and the
+    original held-out/USER01/USER12 corpus this engine was tuned against).
+    A wrapped mid-record field never does - its line continues with policy
+    numbers, dates, dollar amounts or flags, none of which are
+    email-shaped. Confirmed by direct inspection this is a materially
+    stronger signal than "the next word looks alphabetic" alone, which a
+    garbled OCR token (e.g. a corrupted "US" read as "USTN") can slip
+    past."""
+    return any(EMAIL.search(w.text) for w in line_words)

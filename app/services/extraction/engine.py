@@ -204,7 +204,21 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         so window/consumption logic still spans the whole anchor.
 
         Returns (text_start_pos, digits, raw_text) sorted by document
-        position."""
+        position.
+
+        RECORD_ID_NUMERIC covers 5-8 digits, not just 6 (see its own
+        comment in patterns.py for why). For exactly 6 digits that's the
+        only requirement, unchanged. For any other length, a bare digit
+        run is shape-identical to a wrapped ZIP/other numeric field that
+        happens to land leftmost on its own line, so the same content-
+        based checks record_splitter.py's boundary detection uses
+        (patterns.looks_like_name_start / patterns.line_has_email) are
+        required here too - this path populates the record_no FIELD
+        value, and would otherwise be just as liable to mistake a wrapped
+        field for a Record No as boundary detection originally was.
+        RECORD_ID_PREFIXED_NUMERIC is checked BEFORE RECORD_ID_NUMERIC so
+        an 8-digit token that also fits that more specific shape (e.g.
+        "58360441") is never shadowed by the plain-numeric path."""
         by_line: dict[int, list[OCRWord]] = {}
         for w in words:
             by_line.setdefault(w.line_num, []).append(w)
@@ -215,10 +229,16 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             text = w.text.strip()
             if id(w) not in leftmost_ids:
                 continue
-            if pat.RECORD_ID_NUMERIC.fullmatch(text):
-                hits.append((s, text, text))
-            elif pat.RECORD_ID_PREFIXED_NUMERIC.fullmatch(text):
+            if pat.RECORD_ID_PREFIXED_NUMERIC.fullmatch(text):
                 hits.append((s, text[-6:], text))
+            elif pat.RECORD_ID_NUMERIC.fullmatch(text):
+                if len(text) == 6:
+                    hits.append((s, text, text))
+                    continue
+                line_words = sorted(by_line[w.line_num], key=lambda x: x.x)
+                after = [lw for lw in line_words if lw.x > w.x]
+                if after and pat.looks_like_name_start(after[0].text) and pat.line_has_email(line_words):
+                    hits.append((s, text, text))
         hits.sort(key=lambda h: h[0])
         return hits
 
