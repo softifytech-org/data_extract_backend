@@ -60,6 +60,33 @@ def _find_anchor_words(words: list[OCRWord]) -> list[tuple[str, OCRWord]]:
       an 8-digit token that also fits this more specific shape (e.g.
       "58360441") is never suppressed by the plain-numeric path's extra
       requirements.
+
+    A real document uses exactly ONE of these three shapes - never a mix
+    (confirmed against 125 real documents: 81 cached eval files plus the
+    November dataset's 44-image baseline sample, zero exceptions among
+    GENUINE anchors). So once the alphanumeric shape is confidently
+    present on a page, the plain-numeric and prefixed-numeric branches
+    are skipped entirely for that page - a bare digit run elsewhere is
+    then necessarily noise that happens to coincidentally satisfy the
+    numeric shape's own leftmost/companion checks, not a second,
+    different record family sharing the page. Real, confirmed bug this
+    fixes (not hypothetical): a phone-number fragment, "811880", sitting
+    in the MIDDLE of an existing "MI296T3952" record's own body text
+    (between its DOB and currency fields) became its own phantom extra
+    "record" this way - confirmed in 4 of 5 real November-dataset images
+    that showed more anchor-shaped tokens found than records actually
+    produced.
+
+    "Confidently present" requires 2+ alphanumeric matches, not just
+    one - RECORD_ID_ANCHOR itself has rare false positives against
+    ordinary text that happens to fit its confusable-character shape
+    (confirmed real: "BALDORIOTY", a place name, and "ob90@aol.com", an
+    email fragment, both in real cached numeric-family documents). A
+    single stray match there isn't enough evidence to suppress that
+    file's real numeric anchors entirely - a genuine alphanumeric-family
+    page has one such anchor per record, far more than 2, so this
+    threshold costs nothing on real alnum pages while no longer wiping
+    out an entire numeric-family page over one coincidental false match.
     """
     by_line: dict[tuple[int, int], list[OCRWord]] = {}
     for w in words:
@@ -68,12 +95,17 @@ def _find_anchor_words(words: list[OCRWord]) -> list[tuple[str, OCRWord]]:
     for line_words in by_line.values():
         leftmost_ids.add(id(min(line_words, key=lambda w: w.x)))
 
+    alnum_match_count = sum(1 for w in words if pat.RECORD_ID_ANCHOR.search(w.text.strip()))
+    has_alnum_anchor = alnum_match_count >= 2
+
     found: list[tuple[str, OCRWord]] = []
     for w in words:
         text = w.text.strip()
         m = pat.RECORD_ID_ANCHOR.search(text)
         if m:
             found.append((m.group(0).upper(), w))
+            continue
+        if has_alnum_anchor:
             continue
         if id(w) in leftmost_ids and pat.RECORD_ID_PREFIXED_NUMERIC.fullmatch(text):
             found.append((text.upper(), w))
@@ -82,9 +114,14 @@ def _find_anchor_words(words: list[OCRWord]) -> list[tuple[str, OCRWord]]:
             if len(text) == 6:
                 found.append((text, w))
                 continue
-            line_words = sorted(by_line[(w.page, w.line_num)], key=lambda x: x.x)
-            after = [lw for lw in line_words if lw.x > w.x]
-            if after and pat.looks_like_name_start(after[0].text) and pat.line_has_email(line_words):
+            # Y-proximity, not the OCR engine's own line_num grouping - see
+            # _ROW_Y_TOLERANCE above for why.
+            row_words = sorted(
+                (o for o in words if o.page == w.page and abs(o.y - w.y) <= _ROW_Y_TOLERANCE),
+                key=lambda x: x.x,
+            )
+            after = [lw for lw in row_words if lw.x > w.x]
+            if after and pat.looks_like_name_start(after[0].text) and pat.line_has_email(row_words):
                 found.append((text, w))
             continue
     found.sort(key=lambda item: item[1].y)
@@ -98,6 +135,24 @@ def _find_anchor_words(words: list[OCRWord]) -> list[tuple[str, OCRWord]]:
 # family (tens of pixels), comfortably larger than cross-pass jitter on
 # the same line (a few pixels).
 _Y_MERGE_TOLERANCE = 15
+
+# How close two words' Y-coordinates must be (in original-image pixels)
+# to be treated as sitting on the same PRINTED row, for the name+email
+# companion check below - deliberately NOT the same thing as the OCR
+# engine's own line_num grouping. Real-world evidence (reviewer-reported:
+# a whole record silently missing from the output, its text instead
+# absorbed into the PRECEDING record) traced to this: on some scans the
+# OCR engine assigns two different line_num values to words that are
+# visually on the same printed row (e.g. a wide row where the left half -
+# the ID and name - gets one line_num and the right half - the email -
+# gets another, a few pixels lower). The old by-line_num-only lookup then
+# never saw the email at all, so the companion check failed and the
+# anchor was silently dropped, same as if the record didn't exist. Set to
+# under half of Azure's own ~19px row spacing (see choose_reference_
+# boundaries' boundary_margin comment) - wide enough to recombine a
+# fragmented row, narrow enough that it can never reach into a genuinely
+# different, NEXT printed row and borrow that row's name/email instead.
+_ROW_Y_TOLERANCE = 10
 
 
 def choose_reference_boundaries(

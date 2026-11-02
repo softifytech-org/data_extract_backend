@@ -145,6 +145,16 @@ class RecordEntry(BaseModel):
 
     record_index: int
     page: int = 1
+    # This record's own slice of the page, from the SAME boundary
+    # record_splitter.py already computed to decide which words belong to
+    # this record before extraction ever ran - not re-derived from field
+    # bounding boxes. Deliberately not the same thing: a few fields can
+    # carry a bounding box that strayed into a neighboring record's row
+    # (a real, separate extraction-accuracy issue), which makes a region
+    # reconstructed from field boxes alone unreliable for telling two
+    # adjacent records apart. This field is the authoritative one for that.
+    # None for any record saved before this field existed.
+    region: BoundingBox | None = None
     fields: dict[str, ExtractedField] = Field(default_factory=dict)
     cross_field_warnings: list[str] = Field(default_factory=list)
     overall_confidence: float | None = None

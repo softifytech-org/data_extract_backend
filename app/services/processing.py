@@ -28,7 +28,9 @@ import numpy as np
 
 from app.core.config import Settings
 from app.core.logging_config import get_logger
-from app.models.document import DataType, DocumentRecord, DocumentStatus, ExtractedField, FieldStatus, RecordEntry
+from app.models.document import (
+    BoundingBox, DataType, DocumentRecord, DocumentStatus, ExtractedField, FieldStatus, RecordEntry,
+)
 from app.models.document import utcnow
 from app.services.errors import EmptyOcrResultError, InvalidImageError
 from app.services.extraction.aggregator import aggregate_passes
@@ -123,6 +125,7 @@ def _process_record_crop(
     confidence_high_threshold: float,
     paddle_escalation_threshold: float,
     original_filename: str,
+    region: BoundingBox | None = None,
 ) -> RecordEntry:
     """Runs the full preprocessing + multi-pass OCR ensemble on ONE
     record's cropped image, then extracts/aggregates/validates it - the
@@ -169,6 +172,7 @@ def _process_record_crop(
     return RecordEntry(
         record_index=record_index,
         page=page_index,
+        region=region,
         fields=fields,
         cross_field_warnings=warnings,
         overall_confidence=overall_confidence,
@@ -191,9 +195,21 @@ def _process_page(
     if not boundaries:
         return []
 
+    image_height, image_width = image.shape[0], image.shape[1]
     entries: list[RecordEntry] = []
     for i, boundary in enumerate(boundaries):
         crop, y_offset = crop_record(image, boundary.y_start, boundary.y_end)
+        # Same boundary crop_record just used to make `crop` - stored on
+        # the result so the review UI can show just this record's own
+        # region later without re-deriving it (unreliably) from field
+        # bounding boxes. See RecordEntry.region's docstring.
+        region = BoundingBox(
+            page=page_index,
+            x=0,
+            y=max(0, round(boundary.y_start)),
+            width=image_width,
+            height=max(1, round(min(boundary.y_end, image_height) - max(0, boundary.y_start))),
+        )
         entries.append(
             _process_record_crop(
                 crop,
@@ -206,6 +222,7 @@ def _process_page(
                 confidence_high_threshold=confidence_high_threshold,
                 paddle_escalation_threshold=paddle_escalation_threshold,
                 original_filename=original_filename,
+                region=region,
             )
         )
     return entries

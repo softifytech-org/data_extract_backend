@@ -36,6 +36,7 @@ from app.services.extraction.parser import (
     normalize_date_numeric,
     words_in_span,
 )
+from app.services.extraction.record_splitter import _ROW_Y_TOLERANCE
 from app.services.ocr.base import OCRPassResult, OCRWord
 
 NOISE_TOKENS = {
@@ -218,11 +219,45 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         field for a Record No as boundary detection originally was.
         RECORD_ID_PREFIXED_NUMERIC is checked BEFORE RECORD_ID_NUMERIC so
         an 8-digit token that also fits that more specific shape (e.g.
-        "58360441") is never shadowed by the plain-numeric path."""
+        "58360441") is never shadowed by the plain-numeric path.
+
+        The name/email companion lookup below uses Y-proximity, not the
+        OCR engine's own line_num grouping - see record_splitter.py's
+        _ROW_Y_TOLERANCE for why (same real failure mode, same fix,
+        needed identically in both places per this function's own
+        docstring above).
+
+        Also mirrors record_splitter.py's has_alnum_anchor guard, for the
+        identical reason: a real document uses exactly ONE of the three
+        shapes, never a mix, so once this record's OWN alphanumeric ID is
+        genuinely present in its word slice, a bare digit run elsewhere in
+        that same slice is noise, not a competing Record No - without this
+        guard it could silently override the correct alphanumeric
+        record_no with a false numeric match (the caller prefers whatever
+        this function returns over the alphanumeric path).
+
+        Unlike record_splitter.py's page-wide version, this only needs
+        (and only uses) a single genuine alphanumeric match - one record's
+        own slice normally contains exactly one real ID, not many, so a
+        2+ count threshold would almost never fire here. Instead this
+        requires the match to be LEFTMOST on its own line, the same
+        signal the numeric/prefixed branches below already trust: a real
+        record ID is always its line's leading token. Confirmed against
+        the same two real false positives that motivated the page-wide
+        guard (RECORD_ID_ANCHOR matching "BALDORIOTY", a place name, and
+        "ob90@aol.com", an email fragment, in real numeric-family
+        documents) - neither is leftmost on its own line, so this guard
+        does not fire for them, while a genuine record's own ID always
+        is."""
         by_line: dict[int, list[OCRWord]] = {}
         for w in words:
             by_line.setdefault(w.line_num, []).append(w)
         leftmost_ids = {id(min(ws, key=lambda w: w.x)): True for ws in by_line.values()}
+
+        if any(
+            id(w) in leftmost_ids and pat.RECORD_ID_ANCHOR.search(w.text.strip()) for w in words
+        ):
+            return []
 
         hits: list[tuple[int, str, str]] = []
         for s, e, w in spans:
@@ -235,9 +270,11 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 if len(text) == 6:
                     hits.append((s, text, text))
                     continue
-                line_words = sorted(by_line[w.line_num], key=lambda x: x.x)
-                after = [lw for lw in line_words if lw.x > w.x]
-                if after and pat.looks_like_name_start(after[0].text) and pat.line_has_email(line_words):
+                row_words = sorted(
+                    (o for o in words if abs(o.y - w.y) <= _ROW_Y_TOLERANCE), key=lambda x: x.x
+                )
+                after = [lw for lw in row_words if lw.x > w.x]
+                if after and pat.looks_like_name_start(after[0].text) and pat.line_has_email(row_words):
                     hits.append((s, text, text))
         hits.sort(key=lambda h: h[0])
         return hits
@@ -572,22 +609,30 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             # trying prev-line ALL-CAPS before this wrongly grabbed the
             # leftover street-suffix word "LN" instead of same-line
             # "Philadelphia" (which has no recognized suffix, so the
-            # Title-Case fallback above also misses it). None of these 4
-            # tiers are ever reached for old-layout documents (their real
-            # city is always found by one of the two tiers above), but
-            # they're still explicitly gated for the same reason every
-            # other NEW-LAYOUT ONLY block in this file is: a guaranteed,
-            # auditable "old layout never changes" boundary, not a bet on
-            # an unreached-in-practice code path.
-            if self.layout == "new":
-                if not city1:
-                    city1 = self._extract_city(words, consumed, state_1_word, require_upper=False)
-                if not city1:
-                    city1 = self._extract_city(words, consumed, state_1_word, line_offset=-1)
-                if not city1:
-                    city1 = self._extract_city(
-                        words, consumed, state_1_word, line_offset=-1, require_upper=False
-                    )
+            # Title-Case fallback above also misses it).
+            #
+            # No longer NEW-LAYOUT ONLY: these 4 tiers only ever run when
+            # BOTH strict tiers above already returned None (the `if not
+            # city1` gate), so by construction they can never override an
+            # already-correct strict match - the old "old layout never
+            # changes" boundary was a scope choice from when old-layout
+            # never needed this, not a proven-unsafe result. Real,
+            # confirmed need found since (November dataset, multiple
+            # images, layout="old"): genuine mixed-case city names
+            # ("midlothian", "Modesto") and state-wrapped-to-the-previous-
+            # line cases were silently left unfound, which (per Res
+            # Address's own comment below) also took Res Address down
+            # with them. Verified safe against the full 81-file real
+            # old-layout eval corpus: zero already-correct city_1/city_2
+            # values changed, only previously-None ones filled in.
+            if not city1:
+                city1 = self._extract_city(words, consumed, state_1_word, require_upper=False)
+            if not city1:
+                city1 = self._extract_city(words, consumed, state_1_word, line_offset=-1)
+            if not city1:
+                city1 = self._extract_city(
+                    words, consumed, state_1_word, line_offset=-1, require_upper=False
+                )
             if city1:
                 mw, value = city1
                 claim("city_1", mw, value, value)
@@ -598,16 +643,15 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             city2 = self._extract_city(words, consumed, state_2_word)
             if not city2:
                 city2 = self._extract_city_fallback(words, consumed, state_2_word)
-            # NEW-LAYOUT ONLY - see the matching City_1 block above for why.
-            if self.layout == "new":
-                if not city2:
-                    city2 = self._extract_city(words, consumed, state_2_word, require_upper=False)
-                if not city2:
-                    city2 = self._extract_city(words, consumed, state_2_word, line_offset=-1)
-                if not city2:
-                    city2 = self._extract_city(
-                        words, consumed, state_2_word, line_offset=-1, require_upper=False
-                    )
+            # No longer NEW-LAYOUT ONLY - see the matching City_1 block above for why.
+            if not city2:
+                city2 = self._extract_city(words, consumed, state_2_word, require_upper=False)
+            if not city2:
+                city2 = self._extract_city(words, consumed, state_2_word, line_offset=-1)
+            if not city2:
+                city2 = self._extract_city(
+                    words, consumed, state_2_word, line_offset=-1, require_upper=False
+                )
             if city2:
                 mw, value = city2
                 claim("city_2", mw, value, value)
@@ -1200,7 +1244,35 @@ class RuleBasedExtractionEngine(ExtractionEngine):
     # same-line heuristic could otherwise mistake for part of a city name -
     # NOISE_TOKENS already existed for this purpose elsewhere (_find_name_run,
     # _extract_street_address) but _extract_city never consulted it.
-    _CITY_EXCLUSION_VOCAB = NOISE_TOKENS | pat.DAY_MONTH_NAMES
+    #
+    # Street-suffix words (St/Ave/Rd/...) included too - real, confirmed bug
+    # found via manual verification against the actual source image
+    # (November dataset, MI_New T(132).jpeg record 1): the line above
+    # State_1 read "...WOOTiIN RD Gaithersburg" - the real city
+    # ("Gaithersburg") is lowercase and invisible to the ALL-CAPS
+    # line_offset=-1 fallback tier, but "RD" (the street suffix right
+    # before it) IS all-caps and otherwise unexcluded, so it won city_1
+    # outright instead of being skipped past to reach the real city after
+    # it. The primary (same-line) search already stops ITS OWN walk at a
+    # street suffix to avoid absorbing the address - this closes the same
+    # gap for the word being picked AS the city in the first place.
+    _CITY_EXCLUSION_VOCAB = (
+        NOISE_TOKENS | pat.DAY_MONTH_NAMES | pat.STREET_SUFFIX_WORDS | pat.STREET_SUFFIX_WORDS_OCR_VARIANTS
+    )
+
+    @staticmethod
+    def _looks_alphabetic_city_word(text: str) -> bool:
+        """True for a word that's alphabetic once a stray apostrophe is
+        removed - confirmed real, not hypothetical: Azure read "DENTON"
+        as "DENTO'N" (one inserted apostrophe) on a real document (751.
+        jpeg), and a bare .isalpha() check excluded it outright from
+        EVERY city candidate pool below. Since Res Address is recovered
+        by POSITION relative to City_1 (see that field's own comment
+        above), losing City_1 this way silently took Res Address down
+        with it too - not a city-only bug. A real US place name can
+        also legitimately contain an apostrophe (e.g. "Coeur d'Alene"),
+        so this isn't purely a noise accommodation either way."""
+        return text.replace("'", "").replace("’", "").isalpha()
 
     @classmethod
     def _is_city_noise_word(cls, word: str) -> bool:
@@ -1282,7 +1354,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             and w.page == state_word.page
             and w.line_num == state_word.line_num + line_offset
             and (line_offset == 0 and w.x < state_word.x or line_offset != 0)
-            and w.text.isalpha()
+            and cls._looks_alphabetic_city_word(w.text)
             and (w.text.isupper() if require_upper else True)
             and not cls._is_city_noise_word(w.text)
         ]
@@ -1369,7 +1441,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             and w.page == state_word.page
             and w.line_num == state_word.line_num
             and w.x < state_word.x
-            and w.text.isalpha()
+            and cls._looks_alphabetic_city_word(w.text)
             and not cls._is_city_noise_word(w.text)
         ]
         if not same_line:
@@ -1384,8 +1456,21 @@ class RuleBasedExtractionEngine(ExtractionEngine):
     def _find_flag_run(
         words: list[OCRWord], consumed: set[int], layout: str = "old"
     ) -> list[tuple[OCRWord, str]]:
+        # A word already claimed by an earlier field (e.g. a phone
+        # number) is normally excluded here - but when that word has a
+        # flag answer glued onto its own tail with no space (see the
+        # digit-suffix recovery below), the SAME OCR word genuinely
+        # carries two separate pieces of information, and the earlier
+        # claim only accounted for one of them. Re-admitting just these
+        # words (not consumed words generally) lets that glued answer
+        # still be found instead of silently vanishing because the word
+        # was already spoken for.
+        def _has_glued_flag_suffix(text: str) -> bool:
+            return bool(re.search(r"\d(YES|N\.?A\.?|NO)$", text.replace(".", ""), re.IGNORECASE))
+
         ordered = sorted(
-            (w for w in words if id(w) not in consumed), key=lambda w: (w.line_num, w.x)
+            (w for w in words if id(w) not in consumed or _has_glued_flag_suffix(w.text)),
+            key=lambda w: (w.line_num, w.x),
         )
         # NEW-LAYOUT ONLY (the wraps_run allowance below): dense wrapped-paragraph layout (USER01/USER12) sometimes wraps
         # mid-run, with the flag sequence's remaining tokens continuing as
@@ -1409,13 +1494,68 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         current: list[tuple[OCRWord, str]] = []
         prev_line = None
         for w in ordered:
-            match = closest_enum_match(w.text, pat.YES_NO_NA_VALUES, cutoff=0.85)
+            # Periods stripped before the vocabulary comparison - real,
+            # confirmed bug (November dataset, 787.jpeg record 9): OCR
+            # read "NO" as "N.O.", which closest_enum_match's raw
+            # difflib ratio against "NO" (0.67) never clears the 0.85
+            # cutoff - the periods alone were enough to make a real flag
+            # answer invisible. Safe for "N.A" too: stripped to "NA",
+            # already a distinct accepted member of YES_NO_NA_VALUES
+            # itself, not a new fuzzy match.
+            stripped = w.text.replace(".", "")
+            match = closest_enum_match(stripped, pat.YES_NO_NA_VALUES, cutoff=0.85)
+            if not match and stripped.upper() == "NOT":
+                # A confirmed real, recurring OCR misread of "NO" (62
+                # occurrences across 19 of 44 real November-dataset
+                # images) - a trailing "T" is just different enough that
+                # the raw difflib ratio against "NO" (0.80) falls short
+                # of the 0.85 cutoff by a narrow margin, the same kind of
+                # near-miss as "N.O." above, not a coincidence. Breaking
+                # the run on this one word silently cost the LAST flag
+                # (Allergies) in every affected record, the same failure
+                # mode as the period/glued-suffix cases - this is a
+                # third, independent instance of the identical bug
+                # class, not a new mechanism.
+                match = "NO"
+            if not match:
+                # A flag answer is sometimes glued with no space onto the
+                # END of the PRECEDING field's own text - confirmed real
+                # (November dataset, MI_New T(132).jpeg record 1): a
+                # phone number read as "880-6110YES", with the run's
+                # first real flag answer ("YES") completely invisible as
+                # its own token. Left unrecovered, the run comes back
+                # short from the FRONT - which the caller (zip(flag_
+                # fields, flags), front-aligned) then silently maps onto
+                # the WRONG field names for every flag after it, not just
+                # a missing last one; see that zip's own comment. Only
+                # recovered when a DIGIT sits immediately before the
+                # suffix - the real signature of text glued onto a
+                # number (a phone/ID/currency field) - so a genuine word
+                # that merely ends in "no"/"yes" (e.g. a city "Reno")
+                # is never mistaken for this, since it's preceded by a
+                # letter, not a digit.
+                suffix_match = re.search(r"\d(YES|N\.?A\.?|NO)$", stripped, re.IGNORECASE)
+                if suffix_match:
+                    match = closest_enum_match(suffix_match.group(1), pat.YES_NO_NA_VALUES, cutoff=0.85)
             same_line = prev_line is None or w.line_num == prev_line
             wraps_run = (
                 layout == "new" and not same_line and bool(current) and id(w) in leftmost_ids
             )
+            # A token that's ENTIRELY periods (stripped to nothing) is the
+            # other half of the same real bug: OCR sometimes splits one
+            # garbled flag token into a bare "." plus the rest ("N.O.")
+            # as two separate words. Confirmed real (787.jpeg record 9):
+            # "YES YES .N.O. .N.O. . N.O." - the lone "." sits between
+            # two genuine flag tokens and, as a plain non-match, used to
+            # reset the run right before the real 5th flag, silently
+            # losing it even after the period-stripping fix above. Skip
+            # it - mid-run, same line, no real content - rather than
+            # treating it as a run-ending non-match.
+            is_punctuation_noise = bool(w.text) and not stripped
             if match and (same_line or wraps_run):
                 current.append((w, match))
+            elif is_punctuation_noise and current and same_line:
+                pass
             else:
                 current = [(w, match)] if match else []
             if len(current) > len(best):
@@ -2162,8 +2302,27 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         prev_line = None
         for w in ordered:
             same_line = prev_line is None or w.line_num == prev_line
+            # Widened from 0.8x to 1.0x, HERE ONLY (same precedent as the
+            # city-extraction contiguous walk elsewhere in this file) -
+            # real, confirmed need (November dataset): a genuinely
+            # repeated 2-3 word customer name's own real inter-word gap
+            # measured 11-12px against an 11-12px word height (ratio
+            # 0.92-1.0), just over the old 0.8x cutoff, in EVERY one of
+            # its 3 occurrences in the same record ("tedjustok
+            # micheal246") - each occurrence then became two isolated
+            # single words instead of one run, invisible to the repeat-
+            # detection below entirely, and a completely unrelated
+            # Title-Case fragment ("Helen Frederick", itself actually the
+            # real Shipper Name) won by default instead, which then also
+            # consumed the words Shipper Name's own extraction needed.
+            # Verified safe against the real 81-file + 44-image corpora:
+            # only ONE already-found repeated name changed, and that was
+            # a genuine extension (a real 3rd repeated word, "ekristina",
+            # recovered in front of an already-correct "wang mile" - the
+            # same gap-measurement issue, not a new one) - zero
+            # corruptions of an already-correct result.
             close_enough = (
-                not current or w.x - current[-1].right <= max(w.height, current[-1].height) * 0.8
+                not current or w.x - current[-1].right <= max(w.height, current[-1].height) * 1.0
             )
             if word_like(w) and same_line and close_enough:
                 current.append(w)
@@ -2261,7 +2420,16 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             if w.line_num != run[0].line_num:
                 break
             gap = run[0].x - w.right
-            if gap > max(w.height, run[0].height) * 0.8:
+            # Widened from 0.8x to 1.0x - same real, confirmed need as
+            # _find_name_run's identical widening (see that function's own
+            # comment): a genuine 2-word Shipper Name's real inter-word gap
+            # measured 12px against a 12px word height (ratio 1.0, exactly
+            # at the old cutoff's edge) in a real November-dataset record
+            # ("cherrylynne edikis") - each word was isolated instead of
+            # joined into one run, so the >=2 check downstream failed and
+            # Shipper Name came back blank even though its own search
+            # window WAS correctly computed by then.
+            if gap > max(w.height, run[0].height) * 1.0:
                 break
             run.insert(0, w)
         return run[-max_count:]
@@ -2341,9 +2509,38 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # "looks like" (a US place-name reference would not have caught
         # this: "Matschek" is a surname, not a place).
         dup_name_tokens = {t.lower() for t in value.split()}
-        right_boundary = city2_start_key or state_2_key or policy_no_start_key
+        anchor = max((w.line_num, w.x) for w in mw)
+        # City_2/State_2 (when valid - genuinely ahead of Billing Name's
+        # own position) are structurally reliable, TIGHT boundaries and
+        # stay preferred first, same as before. Only when NEITHER is
+        # available does this fall back to a hash-coded anchor
+        # (Policy No/STM Code) - and now tries BOTH, keeping the FARTHER
+        # of the two VALID ones rather than assuming Policy No alone is
+        # always safe to use. Real, confirmed bug (November dataset,
+        # MI_New T(132).jpeg record 1): Policy No's own hash-coded token
+        # was sometimes printed BEFORE Shipper Name's real value in this
+        # document family (not safely after it, as originally assumed for
+        # a different, already-verified family) - picking it anyway built
+        # an inverted/empty window (anchor > right_boundary) at best, or a
+        # window that cut off before the real name at worst, so Shipper
+        # Name came back silently blank. STM Code, the OTHER
+        # independently-detected hash-coded anchor, was still genuinely
+        # past the real name in that same record. Taking the FARTHER of
+        # the two (not the nearer) matches this fallback's own original
+        # design intent, documented below: a hash-coded position is
+        # expected to widen the window substantially, with the trailing-
+        # contiguous-run walk doing the real precision work, not the
+        # window's own tightness.
+        if city2_start_key is not None and city2_start_key > anchor:
+            right_boundary = city2_start_key
+        elif state_2_key is not None and state_2_key > anchor:
+            right_boundary = state_2_key
+        else:
+            hash_candidates = [
+                k for k in (policy_no_start_key, stm_code_start_key) if k is not None and k > anchor
+            ]
+            right_boundary = max(hash_candidates) if hash_candidates else None
         if right_boundary is not None:
-            anchor = max((w.line_num, w.x) for w in mw)
             candidates_ship = [
                 w
                 for w in words
@@ -2444,7 +2641,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                     for w in words
                     if id(w) not in consumed
                     and city2_left < (w.line_num, w.x) < state_2_key
-                    and w.text.isalpha()
+                    and self._looks_alphabetic_city_word(w.text)
                     and not self._is_city_noise_word(w.text)
                 ]
                 city2_run = self._trailing_contiguous_run(city2_candidates)

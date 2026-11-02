@@ -16,6 +16,7 @@ already on record (09104.jpeg records 241037/241039).
 """
 from __future__ import annotations
 
+from app.services.extraction import patterns as pat
 from app.services.extraction.engine import RuleBasedExtractionEngine, _smart_join
 from app.services.extraction.parser import build_indexed_text
 from app.services.ocr.base import OCRWord
@@ -204,6 +205,45 @@ def test_numeric_record_ids_five_digit_rejected_when_companion_is_a_day_name():
     assert _run_numeric_record_ids(words) == []
 
 
+def test_numeric_record_ids_companion_found_across_split_line_num():
+    """Same real bug, same fix, as record_splitter.py's identical test -
+    this is the separate record_no FIELD-population path, which needs the
+    identical Y-proximity companion lookup or a record whose boundary WAS
+    found correctly could still save with record_no blank."""
+    words = [
+        _word("9286578", x=0, width=70, line_num=5, y=400),
+        _word("Ldiamond", x=80, width=70, line_num=5, y=400),
+        _word("jblue@WIZREALM.COM", x=400, width=150, line_num=6, y=403),
+    ]
+    hits = _run_numeric_record_ids(words)
+    assert [h[1] for h in hits] == ["9286578"]
+
+
+def test_numeric_record_ids_companion_not_pulled_from_next_printed_row():
+    words = [
+        _word("9286578", x=0, width=70, line_num=5, y=400),
+        _word("Ldiamond", x=80, width=70, line_num=5, y=400),
+        _word("NextCust", x=0, width=70, line_num=6, y=419),
+        _word("jblue@WIZREALM.COM", x=80, width=150, line_num=6, y=419),
+    ]
+    assert _run_numeric_record_ids(words) == []
+
+
+def test_numeric_record_ids_companion_email_split_across_two_words():
+    """Same real bug as record_splitter.py's identical test - this is the
+    separate record_no FIELD-population path, which needs the identical
+    fix or a record whose boundary WAS found correctly could still save
+    with record_no blank."""
+    words = [
+        _word("9286578", x=0, width=70, line_num=20, y=400),
+        _word("Ldiamond", x=80, width=70, line_num=20, y=400),
+        _word("jblue@WIZREALM.", x=160, width=104, line_num=20, y=400),
+        _word("COM", x=266, width=25, line_num=20, y=400),
+    ]
+    hits = _run_numeric_record_ids(words)
+    assert [h[1] for h in hits] == ["9286578"]
+
+
 def test_numeric_record_ids_eight_digit_prefix_overlap_uses_trailing_six_digits():
     """"58360441" matches both RECORD_ID_NUMERIC (8 plain digits) and
     RECORD_ID_PREFIXED_NUMERIC ("5"+"8"+6 digits). It must still take the
@@ -242,3 +282,237 @@ def test_phone_strips_hyphen_adjacent_join_space():
     _, value, raw = results[0]
     assert value == "907-722-5546"
     assert raw == "907- 722-5546"
+
+
+# --- patterns.STREET_ADDRESS: suffix must be its own word, not a tail
+# fragment of an unrelated longer word (real November-dataset bug) ---
+
+def test_street_address_does_not_match_card_as_road_suffix():
+    """Real, confirmed bug (not hypothetical): res_address came back as
+    '1938 MALE UnionPay Card' (and 23 other near-identical cases across
+    15 images in the November dataset's 44-image baseline sample) because
+    the old regex had no word boundary BEFORE the suffix alternation, so
+    the greedy {4,60} middle class could stop matching mid-word and let
+    "Rd" (Road) match the tail of "Card"/"MasterCard" instead of a real,
+    standalone road abbreviation. None of these should match at all - the
+    only "address-shaped" content here is a stray date fragment, a
+    gender, and a payment card name, not a street."""
+    for text in [
+        "1938 MALE UnionPay Card",
+        "1982 MALE MasterCard",
+        "04/05/1938 MALE UnionPay Card AMBIEN",
+        "1956 27-Sep-82 FEMALE Maestro Card",
+    ]:
+        assert pat.STREET_ADDRESS.search(text) is None, text
+
+
+def test_street_address_still_matches_genuine_addresses():
+    """The added word boundary must not cost any real match - confirmed
+    against real address shapes already relied upon elsewhere in this
+    document family (see engine.py's _extract_gap/_extract_street_address
+    comments)."""
+    cases = {
+        "12345 Main St": "12345 Main St",
+        "269 Longliaf Circle": "269 Longliaf Circle",
+        "18513 Grackli Way Rd Denair": "18513 Grackli Way Rd",
+        "8131 240TH ST. SW.23630": "8131 240TH ST",
+        "432 Chapman Dr 5728": "432 Chapman Dr",
+    }
+    for text, expected in cases.items():
+        m = pat.STREET_ADDRESS.search(text)
+        assert m is not None, text
+        assert m.group(0) == expected
+
+
+def test_res_address_fallback_no_longer_grabs_card_name_text():
+    """End-to-end reproduction of the real failing record (787.jpeg,
+    USER 4 69N, November dataset): with City_1 unavailable (so
+    _extract_gap can't run) and a stray unconsumed digit near a Card Name
+    value, res_address must come back as None (preserve uncertainty) or a
+    real address fragment - never the old wrong value built from a date
+    remnant + gender + card name."""
+    words = [
+        _word("1938", x=18, width=40, line_num=9, y=146),
+        _word("MALE", x=114, width=40, line_num=9, y=147),
+        _word("UnionPay", x=168, width=60, line_num=9, y=147),
+        _word("Card", x=232, width=35, line_num=9, y=147),
+    ]
+    text, spans = build_indexed_text(words)
+    result = RuleBasedExtractionEngine._extract_street_address(text, spans, set())
+    assert result is None
+
+
+# --- _find_numeric_record_ids: suppressed when the record's own
+# alphanumeric ID is genuinely present (mirrors record_splitter.py's
+# page-wide guard, scoped to one record's own word slice) ---
+
+def test_numeric_record_id_suppressed_by_own_leftmost_alnum_id():
+    """A record whose own ID is the alphanumeric shape must never have
+    that overridden by some other, coincidentally numeric-shaped token
+    elsewhere in its own word slice - the caller prefers whatever this
+    function returns over the correct alphanumeric path, so a wrong
+    non-empty result here would silently corrupt record_no."""
+    words = [
+        _word("MI296T3952", x=17, width=70, line_num=0, y=0),
+        _word("811880", x=66, width=50, line_num=5, y=100),
+        _word("Someone", x=150, width=60, line_num=5, y=100),
+        _word("a@b.com", x=250, width=60, line_num=5, y=100),
+    ]
+    assert _run_numeric_record_ids(words) == []
+
+
+def test_numeric_record_id_unaffected_by_non_leftmost_alnum_false_positive():
+    """A coincidental alphanumeric-shaped match that is NOT leftmost on
+    its own line (the same real false-positive shape as "BALDORIOTY"/
+    "ob90@aol.com" - see record_splitter.py's identical test) must not
+    suppress this record's own genuine numeric ID."""
+    words = [
+        _word("241001", x=0, width=50, line_num=0, y=0),
+        _word("BALDORIOTY", x=300, width=70, line_num=0, y=0),
+    ]
+    hits = _run_numeric_record_ids(words)
+    assert [h[1] for h in hits] == ["241001"]
+
+
+# --- _find_flag_run: 5-answer YES/NO/N.A run for Alcoholic/Smoker/
+# Past_Surg/Diabetic/Allergies - a SHORT run is dangerous, not just
+# incomplete: the caller (zip(flag_fields, flags), front-aligned) maps
+# a short run onto the WRONG field names whenever the run is missing its
+# FIRST item, silently shifting every value down by one slot. ---
+
+def test_flag_run_recovers_answer_glued_to_a_phone_number():
+    """Real, confirmed bug (November dataset, MI_New T(132).jpeg record
+    1): the flag run's first answer was glued with no space onto the
+    end of a phone number OCR read as "880-6110YES", making it
+    completely invisible as its own token - the run came back 4 long
+    instead of 5, and the front-aligned zip then silently shifted every
+    value to the wrong field (alcoholic got smoker's true answer, smoker
+    got past_surg's, etc.), with allergies simply lost. All 5 must come
+    back in the correct original order."""
+    words = [
+        _word("880-6110YES", x=497, width=100, line_num=2, y=48),
+        _word("YES", x=594, width=30, line_num=2, y=48),
+        _word("NO", x=642, width=25, line_num=2, y=48),
+        _word("NO", x=690, width=25, line_num=2, y=48),
+        _word("YES", x=738, width=30, line_num=2, y=48),
+    ]
+    found = RuleBasedExtractionEngine._find_flag_run(words, set(), "old")
+    assert [v for _, v in found] == ["YES", "YES", "NO", "NO", "YES"]
+
+
+def test_flag_run_does_not_glue_a_word_merely_ending_in_no():
+    """The digit-before-suffix requirement must reject a genuine word
+    that happens to end in "no"/"yes" (e.g. a real place name like
+    "Reno") - only a DIGIT immediately before the suffix is the real
+    signature of text glued onto a number, never a letter."""
+    words = [
+        _word("Reno", x=0, width=40, line_num=0, y=0),
+        _word("YES", x=50, width=30, line_num=0, y=0),
+    ]
+    found = RuleBasedExtractionEngine._find_flag_run(words, set(), "old")
+    assert [v for _, v in found] == ["YES"]
+
+
+def test_flag_run_glued_suffix_recovered_even_when_word_already_consumed():
+    """The glued word is normally claimed first by phone extraction
+    (consumed before flags run) - the glued flag answer must still be
+    recoverable from it, not silently lost because the word was already
+    spoken for by a different field."""
+    words = [
+        _word("880-6110YES", x=497, width=100, line_num=2, y=48),
+        _word("NO", x=594, width=25, line_num=2, y=48),
+    ]
+    already_consumed = {id(words[0])}
+    found = RuleBasedExtractionEngine._find_flag_run(words, already_consumed, "old")
+    assert [v for _, v in found] == ["YES", "NO"]
+
+
+# --- _find_name_run / _trailing_contiguous_run: same-phrase gap
+# threshold widened from 0.8x to 1.0x word-height (both functions,
+# identical real-data-measured reason) ---
+
+def test_find_name_run_recovers_repeated_name_with_12px_gap():
+    """Real, confirmed bug (November dataset, MI_New T(132).jpeg record
+    1): a genuinely repeated 2-word customer name ("tedjustok
+    micheal246") printed with an 11-12px inter-word gap against an 11-
+    12px word height (ratio ~0.92-1.0) in ALL 3 of its occurrences -
+    just over the old 0.8x cutoff, so neither word ever joined into a
+    2-word run and the repeat-detection never saw it at all. A
+    completely unrelated name won by default instead, which then also
+    blocked Shipper Name's own extraction (it depends on Billing Name's
+    real position). Must now be found as the repeated name."""
+    words = [
+        _word("tedjustok", x=114, width=54, line_num=0, y=19, height=11),
+        _word("micheal246", x=179, width=61, line_num=0, y=19, height=12),
+        _word("tedjustok", x=642, width=53, line_num=1, y=34, height=12),
+        _word("micheal246", x=706, width=62, line_num=1, y=34, height=12),
+    ]
+    result = RuleBasedExtractionEngine._find_name_run(words, set(), allow_alnum=True)
+    assert result is not None
+    value, is_repeated = result[1], result[2]
+    assert value == "tedjustok micheal246"
+    assert is_repeated is True
+
+
+def test_trailing_contiguous_run_recovers_12px_gap():
+    """Real, confirmed bug (same record as above): Shipper Name's own
+    2-word value ("cherrylynne edikis") had a 12px gap against a 12px
+    word height (ratio 1.0, exactly at the old cutoff) - each word was
+    isolated instead of joined, so the >=2-token check downstream failed
+    and Shipper Name came back blank even once its search window was
+    otherwise computed correctly."""
+    words = [
+        _word("cherrylynne", x=66, width=65, line_num=2, y=48, height=12),
+        _word("edikis", x=143, width=37, line_num=2, y=48, height=11),
+    ]
+    run = RuleBasedExtractionEngine._trailing_contiguous_run(words)
+    assert [w.text for w in run] == ["cherrylynne", "edikis"]
+
+
+def test_flag_run_treats_not_as_no():
+    """Real, recurring pattern (62 occurrences across 19 of 44 real
+    November-dataset images, confirmed against the actual source image
+    for one case - MI_New T(132).jpeg record 2, which visually prints
+    "YES NOT YES NO NO NO"): a token reading "NOT" sits where a flag
+    answer belongs, one letter off from "NO" (raw difflib ratio 0.80,
+    just under the 0.85 cutoff). Breaking the run here previously cost
+    the run's LAST slot (Allergies) in every affected record - the exact
+    same failure mode as the period/glued-suffix cases already fixed,
+    not a new mechanism. All 6 real tokens here must resolve into one
+    unbroken run, keeping the trailing 5 (see _find_flag_run's own
+    comment on why the trailing slice, not the leading one, is correct)."""
+    words = [
+        _word("YES", x=355, width=19, line_num=7, y=118),
+        _word("NOT", x=401, width=19, line_num=7, y=118),
+        _word("YES", x=426, width=18, line_num=7, y=118),
+        _word("NO", x=450, width=14, line_num=7, y=119),
+        _word("NO", x=497, width=15, line_num=7, y=119),
+        _word("NO", x=545, width=15, line_num=7, y=119),
+    ]
+    found = RuleBasedExtractionEngine._find_flag_run(words, set(), "old")
+    assert [v for _, v in found] == ["NO", "YES", "NO", "NO", "NO"]
+
+
+def test_extract_city_skips_street_suffix_to_reach_real_lowercase_city():
+    """Real, confirmed bug found via manual verification against the
+    actual source image (November dataset, MI_New T(132).jpeg record 1):
+    the line above State_1 read "...WOOTiIN RD Gaithersburg" - the real
+    city ("Gaithersburg") is lowercase, invisible to the ALL-CAPS
+    line_offset=-1 tier, so "RD" (the all-caps street suffix right
+    before it) won city_1 outright instead of being skipped past. Must
+    now reach the real city on the require_upper=False tier instead of
+    stopping at the suffix."""
+    words = [
+        _word("WOOTiIN", x=620, width=50, line_num=0, y=19),
+        _word("RD", x=667, width=23, line_num=0, y=19),
+        _word("Gaithersburg", x=690, width=90, line_num=0, y=20),
+        _word("NE", x=66, width=14, line_num=1, y=34),
+    ]
+    state_word = words[-1]
+    city = RuleBasedExtractionEngine._extract_city(words, set(), state_word, line_offset=-1)
+    assert city is None  # the ALL-CAPS tier must not pick "RD"
+    city = RuleBasedExtractionEngine._extract_city(
+        words, set(), state_word, line_offset=-1, require_upper=False
+    )
+    assert city is not None
+    assert city[1] == "Gaithersburg"

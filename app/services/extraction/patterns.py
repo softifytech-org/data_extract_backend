@@ -11,9 +11,25 @@ import re
 # no space at all (e.g. "MI296T23psychonurse") - a boundary requirement
 # after the final digit would refuse to match there, since both a digit and
 # a following lowercase letter are "word" characters in regex terms. The
-# fixed-width groups already bound the match to exactly 8 characters, so
-# dropping the trailing \b doesn't risk over-matching.
-RECORD_ID = re.compile(r"\b[A-Z]{2}\d{3}[A-Z]\d{2}")
+# trailing digit group's own {2,5} upper bound is what keeps the match from
+# over-matching, not a fixed width - see the comment on the trailing group
+# below for why it's a range rather than exactly 2.
+#
+# Trailing digit group widened from a fixed 2 digits to 2-5: verified
+# directly against a real document whose anchors print as "MI296T27312",
+# "MI296T27313", ... "MI296T27353" - a genuine 5-digit trailing run, not 2.
+# The old exactly-\d{2} pattern silently truncated these mid-match (a plain
+# `.search()` with no length requirement just stops once its own pattern is
+# satisfied), storing "29627" instead of the real "29627312" - the record
+# was still found and split correctly (boundary detection only needs the
+# anchor's grid POSITION, not its exact text), only the Record No VALUE
+# came out wrong. 2-5 keeps the final digits-only value (3-digit middle
+# group + this trailing group) inside the same 5-8 digit range already
+# established and verified for the plain-numeric Record No family below
+# (RECORD_ID_NUMERIC) - not a new, separately-invented bound. The original
+# exactly-2-digit shape ("MI296T23") still matches unchanged, since {2,5}
+# accepts 2 digits same as before.
+RECORD_ID = re.compile(r"\b[A-Z]{2}\d{3}[A-Z]\d{2,5}")
 # Characters Tesseract commonly substitutes for a digit in this document
 # family - shared with parser.normalize_confusable_digits, which maps them
 # back. Kept broad (I/l/L/| for 1, Z/z for 2, O/o/Q/D/@ for 0) because a
@@ -21,18 +37,23 @@ RECORD_ID = re.compile(r"\b[A-Z]{2}\d{3}[A-Z]\d{2}")
 # too strict silently drops entire records from detection.
 _DIGIT_CONFUSABLE_CLASS = r"0-9OoQD@IlL|Zz"
 # Tolerant fallback: only tried when the strict pattern above finds nothing
-# - see extraction/engine.py.
+# - see extraction/engine.py. Trailing group widened in lockstep with
+# RECORD_ID above, same reason.
 RECORD_ID_FUZZY = re.compile(
-    rf"\b([A-Z]{{2}})([{_DIGIT_CONFUSABLE_CLASS}]{{3}})([A-Z])([{_DIGIT_CONFUSABLE_CLASS}]{{2}})"
+    rf"\b([A-Z]{{2}})([{_DIGIT_CONFUSABLE_CLASS}]{{3}})([A-Z])([{_DIGIT_CONFUSABLE_CLASS}]{{2,5}})"
 )
 # Deliberately looser still - used only to locate record BOUNDARIES on a
 # densely multi-record page (see extraction/record_splitter.py), not to
 # read the ID's actual text. On this document family, Tesseract sometimes
 # misreads the leading two letters badly enough (M/I -> w/r) that even the
-# fuzzy pattern above won't match - but the LL-DDD-L-DD *shape* is usually
-# still recognizable, which is all boundary detection needs.
+# fuzzy pattern above won't match - but the LL-DDD-L-DD shape is usually
+# still recognizable, which is all boundary detection needs. Trailing group
+# widened in lockstep with RECORD_ID above, same reason - this one doesn't
+# strictly need it for boundary POSITIONING (that only uses the matched
+# word's own x/y), but keeping all three patterns in sync avoids a
+# surprise mismatch between the anchor hint text and the real value later.
 RECORD_ID_ANCHOR = re.compile(
-    rf"\b[A-Za-z]{{2}}[{_DIGIT_CONFUSABLE_CLASS}]{{3}}[A-Za-z][{_DIGIT_CONFUSABLE_CLASS}]{{2}}"
+    rf"\b[A-Za-z]{{2}}[{_DIGIT_CONFUSABLE_CLASS}]{{3}}[A-Za-z][{_DIGIT_CONFUSABLE_CLASS}]{{2,5}}"
 )
 
 # A second, distinct document family in this schema prints Record No as a
@@ -153,9 +174,25 @@ DAY_MONTH_NAMES = {
     "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
 }
 
+# The \b BEFORE the suffix group (not just after) is deliberate, not
+# redundant - confirmed real, systemic false-positive bug: without it,
+# the greedy {4,60} middle class can stop matching mid-word, letting the
+# suffix alternation match a TAIL FRAGMENT of an unrelated longer word
+# instead of a real, standalone abbreviation. "Rd" (Road) matched inside
+# "UnionPay Card"/"MasterCard"/"Maestro Card" (the suffix is "...Ca" +
+# "rd", not an actual road abbreviation) in 24 separate real records
+# across 15 images in the November dataset, every one of them a Card
+# Name value sitting near a stray unconsumed digit (confirmed via
+# res_address values like "1938 MALE UnionPay Card" - see
+# evaluation/november_baseline_report.json). The same tail-collision risk
+# exists for "St" (test, August, almost...), "Ter" (water, letter,
+# master...), "Way" (highway, away...) and others - \b requires an actual
+# word boundary immediately before the suffix starts, which a mid-word
+# position between two letters never satisfies, so none of these can
+# match as a substring of a longer, unrelated word anymore.
 STREET_ADDRESS = re.compile(
     r"\b\d{1,6}\s+[A-Za-z0-9.\-'#\s]{4,60}"
-    r"(?:St\.?|Street|Ave\.?|Avenue|Dr\.?|Drive|Rd\.?|Road|Ln\.?|Lane|Blvd\.?|Cir\.?|Circle|"
+    r"\b(?:St\.?|Street|Ave\.?|Avenue|Dr\.?|Drive|Rd\.?|Road|Ln\.?|Lane|Blvd\.?|Cir\.?|Circle|"
     r"Ct\.?|Court|Way|Pkwy\.?|Parkway|Terrace|Ter\.?|Trail|Place|Pl\.?|Loop|Square|Sq\.?)\b",
     re.IGNORECASE,
 )
@@ -261,6 +298,18 @@ def looks_like_name_start(text: str) -> bool:
     return stripped not in _NON_NAME_VOCAB
 
 
+# How close two adjacent words' boxes must be (end of one to start of the
+# next, in pixels) to be tried as one OCR-split email - see line_has_email
+# below. Confirmed real, from two actual reviewer-reported missing-record
+# documents: Azure's layout OCR split "jblue@WIZREALM.COM" into
+# "jblue@WIZREALM." + "COM" (a 2px gap) and "jwong@SLIP.NET" into
+# "jwong@SLIP." + "NET" (a 3px gap) - both right after the final '.',
+# where the TLD landed as its own token. A genuine word-to-word gap on the
+# same real rows measured 6-40px, so 4px cleanly separates "one token
+# split in two" from "two different words" without widening the net.
+_EMAIL_SPLIT_MAX_GAP = 4
+
+
 def line_has_email(line_words) -> bool:
     """A genuine record-start line carries a CustomerName/ShipperName AND
     an email address shortly after the ID, confirmed present on every real
@@ -271,5 +320,22 @@ def line_has_email(line_words) -> bool:
     email-shaped. Confirmed by direct inspection this is a materially
     stronger signal than "the next word looks alphabetic" alone, which a
     garbled OCR token (e.g. a corrupted "US" read as "USTN") can slip
-    past."""
-    return any(EMAIL.search(w.text) for w in line_words)
+    past.
+
+    Also tries joining each pair of immediately-adjacent words (sorted
+    left to right, touching or nearly touching - see
+    _EMAIL_SPLIT_MAX_GAP) before giving up - real bug, not a hypothetical:
+    two whole records silently vanished from reviewer-reported documents
+    because Azure split their one printed email into two OCR words right
+    after the final '.', and neither fragment alone is email-shaped, so
+    the single-word check failed the companion test and the anchor (and
+    everything _find_anchor_words/_find_numeric_record_ids needed it for)
+    was silently dropped."""
+    if any(EMAIL.search(w.text) for w in line_words):
+        return True
+    ordered = sorted(line_words, key=lambda w: w.x)
+    for a, b in zip(ordered, ordered[1:]):
+        gap = b.x - (a.x + a.width)
+        if gap <= _EMAIL_SPLIT_MAX_GAP and EMAIL.search(a.text + b.text):
+            return True
+    return False

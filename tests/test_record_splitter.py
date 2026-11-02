@@ -172,6 +172,77 @@ def test_five_digit_record_id_rejected_when_companion_is_a_day_name():
     assert _find_anchor_words(words) == []
 
 
+def test_numeric_record_id_companion_found_across_split_line_num():
+    """Real reviewer-reported bug: a record silently missing from the
+    output, its fields absorbed into the PRECEDING record instead. Traced
+    to the OCR engine sometimes assigning two different line_num values to
+    words on the SAME printed row (e.g. the email, a few pixels lower than
+    the ID+name on the same row, landing in a different line_num bucket).
+    The old by-line_num-only lookup never saw the email in that case and
+    silently dropped the whole anchor. Companions here share the ID's Y
+    (within _ROW_Y_TOLERANCE) but NOT its line_num, and must still be
+    found."""
+    words = [
+        _word("9286578", x=0, width=70, line_num=5, y=400),
+        _word("Ldiamond", x=80, width=70, line_num=5, y=400),
+        _word("jblue@WIZREALM.COM", x=400, width=150, line_num=6, y=403),
+    ]
+    assert [t for t, _ in _find_anchor_words(words)] == ["9286578"]
+
+
+def test_numeric_record_id_companion_not_pulled_from_next_printed_row():
+    """The Y-proximity widening above must not reach far enough to borrow
+    a genuinely DIFFERENT, next printed row's email - only a same-row
+    fragment split across line_num. No email on the ID's own row means no
+    anchor, even though an email exists a full row (19px, matching Azure's
+    real row spacing) below."""
+    words = [
+        _word("9286578", x=0, width=70, line_num=5, y=400),
+        _word("Ldiamond", x=80, width=70, line_num=5, y=400),
+        _word("NextCust", x=0, width=70, line_num=6, y=419),
+        _word("jblue@WIZREALM.COM", x=80, width=150, line_num=6, y=419),
+    ]
+    assert _find_anchor_words(words) == []
+
+
+def test_numeric_record_id_companion_email_split_across_two_words():
+    """Real reviewer-reported bug: two whole records (9286578 and 9286594,
+    from real documents "MI 27_K-1 (1).jpeg" and "(3).jpeg") silently
+    vanished from the output. Root cause, confirmed against the real
+    Azure OCR response for these exact images: the record's own email
+    got split into two OCR words right after the final '.' - "jblue@
+    WIZREALM." + "COM" (a 2px gap) - so neither fragment alone was
+    email-shaped and the companion check rejected a perfectly good
+    anchor. Companions here reproduce that exact real split, including
+    the real 2px gap - _record_line's default 10px companion spacing is
+    deliberately NOT used here since it would be wider than the real
+    split this test exists to reproduce."""
+    words = [
+        _word("9286578", x=0, width=70, line_num=20, y=400),
+        _word("Ldiamond", x=80, width=70, line_num=20, y=400),
+        _word("jblue@WIZREALM.", x=160, width=104, line_num=20, y=400),
+        _word("COM", x=266, width=25, line_num=20, y=400),
+    ]
+    assert [t for t, _ in _find_anchor_words(words)] == ["9286578"]
+
+
+def test_numeric_record_id_companion_email_split_not_glued_across_normal_gap():
+    """The concatenation check above must not fire across an ordinary
+    word-to-word gap - only a near-touching split. "jblue@WIZREALM" and
+    "COM" here are far enough apart (comfortably more than the 2-3px real
+    split gaps above) that they must be treated as two unrelated words,
+    not one glued-together email - so the anchor is correctly rejected
+    (neither fragment is email-shaped alone, same as any other
+    no-email line)."""
+    words = [
+        _word("9286578", x=0, width=70, line_num=20, y=400),
+        _word("Ldiamond", x=80, width=70, line_num=20, y=400),
+        _word("jblue@WIZREALM", x=160, width=90, line_num=20, y=400),
+        _word("COM", x=300, width=30, line_num=20, y=400),
+    ]
+    assert _find_anchor_words(words) == []
+
+
 def test_eight_digit_token_matching_both_shapes_uses_prefixed_path():
     """"58360441" is shape-identical to BOTH RECORD_ID_NUMERIC (8 plain
     digits) and RECORD_ID_PREFIXED_NUMERIC ("5"+"8"+6 digits). It must
@@ -181,3 +252,51 @@ def test_eight_digit_token_matching_both_shapes_uses_prefixed_path():
     would already have found."""
     words = [_word("58360441", x=0, width=70, line_num=0, y=0)]
     assert [t for t, _ in _find_anchor_words(words)] == ["58360441"]
+
+
+# --- Alphanumeric vs numeric/prefixed anchor mutual exclusivity ---
+# Real documents use exactly ONE anchor shape per page, never a mix -
+# see _find_anchor_words' own docstring for the full evidence.
+
+def test_numeric_anchor_suppressed_when_page_has_real_alnum_anchors():
+    """Real, confirmed bug (MI_New T(288).jpeg, November dataset): a
+    phone-number fragment "811880" sitting in the middle of an existing
+    alphanumeric record's own body text coincidentally satisfied the
+    plain-numeric shape's leftmost+name+email companion check and became
+    its own phantom extra record. With 2+ genuine alphanumeric anchors on
+    the page, a bare-digit token elsewhere must never be treated as a
+    second, competing record family."""
+    words = [
+        _word("MI296T3949", x=17, width=70, line_num=0, y=0),
+        _word("MI296T3950", x=17, width=70, line_num=10, y=200),
+        # A stray leftmost 6-digit number elsewhere on the page, with a
+        # name-shaped word and an email on its own row - satisfies every
+        # requirement the plain-numeric path checks for, on its own.
+        _word("811880", x=66, width=50, line_num=20, y=400),
+        _word("Someone", x=150, width=60, line_num=20, y=400),
+        _word("a@b.com", x=250, width=60, line_num=20, y=400),
+    ]
+    found = [t for t, _ in _find_anchor_words(words)]
+    assert found == ["MI296T3949", "MI296T3950"]
+    assert "811880" not in found
+
+
+def test_numeric_anchors_unaffected_by_a_single_alnum_false_positive():
+    """RECORD_ID_ANCHOR itself has rare false positives against ordinary
+    text that happens to fit its confusable-character shape (confirmed
+    real: "BALDORIOTY", a place name, and "ob90@aol.com", an email
+    fragment, both found in real cached NUMERIC-family documents). A
+    single stray match like this must not suppress that page's real
+    numeric anchors - only 2+ alphanumeric matches are confident enough
+    evidence that this is genuinely an alphanumeric-family page."""
+    words = [
+        _word("241001", x=0, width=50, line_num=0, y=0),
+        _word("241002", x=0, width=50, line_num=10, y=200),
+        # A single coincidental alphanumeric-shaped false positive,
+        # unrelated to either real record, leftmost on neither line.
+        _word("Somewhere", x=300, width=70, line_num=0, y=0),
+        _word("BALDORIOTY", x=300, width=70, line_num=10, y=200),
+    ]
+    found = [t for t, _ in _find_anchor_words(words)]
+    assert "241001" in found
+    assert "241002" in found

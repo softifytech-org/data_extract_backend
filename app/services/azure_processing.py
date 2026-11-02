@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from app.models.document import RecordEntry
+from app.models.document import BoundingBox, RecordEntry
 from app.services.extraction.aggregator import AggregatedField
 from app.services.extraction.engine import RuleBasedExtractionEngine
 from app.services.extraction.record_splitter import (
@@ -48,10 +48,26 @@ def process_page_azure(
         return []
     slices = slice_words_by_boundaries(words, boundaries)
 
+    image_height, image_width = image.shape[0], image.shape[1]
+
     entries: list[RecordEntry] = []
     for i, sl in enumerate(slices):
         if not sl:
             continue
+        boundary = boundaries[i]
+        # Full page width, clipped y-range - matches how record_splitter
+        # itself treats a boundary (a horizontal band across the whole
+        # row), and is exactly the range slice_words_by_boundaries just
+        # used to decide which words belong to this record. y_end can be
+        # +inf for the last record on the page; clip it to the real image
+        # height rather than storing an unusable value.
+        region = BoundingBox(
+            page=page_index,
+            x=0,
+            y=max(0, round(boundary.y_start)),
+            width=image_width,
+            height=max(1, round(min(boundary.y_end, image_height) - max(0, boundary.y_start))),
+        )
         pass_result = OCRPassResult(
             variant="azure", page=page_index, ocr_config="azure-prebuilt-layout", words=sl
         )
@@ -87,6 +103,7 @@ def process_page_azure(
             RecordEntry(
                 record_index=starting_record_index + i,
                 page=page_index,
+                region=region,
                 fields=fields,
                 cross_field_warnings=warnings,
                 overall_confidence=overall_confidence,
