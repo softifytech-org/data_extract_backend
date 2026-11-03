@@ -510,7 +510,41 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             return f"Closest known value: {suggestion}" if suggestion else None
 
         # --- gender x2 (Sex_1 early, Sex_2 late) ---
+        # A looser-cutoff fallback for the case where OCR garbles one
+        # occurrence badly (e.g. "FAM?LE" for "FEMALE") was tried and
+        # measured directly against the November-dump sample: it recovered
+        # that case but cost far more elsewhere, matching unrelated words
+        # (a real regression found this way: "MUSCLE" - from the city
+        # "Muscle Shoals" - fuzzy-matched "MALE" at a 0.6 cutoff) and,
+        # even after tightening to 0.65, still net-regressed Sex_1 badly
+        # (280 correct vs 442 before, on the same sample) by pulling a
+        # spurious earlier "match" into the Sex_1 slot and bumping the
+        # real one down to Sex_2. Reverted - no cutoff tried came close to
+        # paying for itself; the plain 0.8-cutoff match below remains the
+        # evidence-backed behavior.
         genders = self._match_all_single_token_enum(words, consumed, pat.GENDER_VALUES)
+        if len(genders) == 1:
+            # Position-aware disambiguation using DOB's own already-
+            # extracted position (date extraction runs immediately above)
+            # instead of a text-similarity fallback - requested
+            # specifically after the fuzzy-cutoff attempt above regressed
+            # Sex_1 badly. Schema order places Sex_1 well before DOB and
+            # Sex_2 well after it, so a single match's position relative
+            # to DOB reliably says which slot it really is, without
+            # guessing at what the OTHER slot's value might be - that
+            # slot is correctly left blank either way, never filled with
+            # a lower-confidence guess the way the reverted approach did.
+            only_w, only_value, only_sugg = genders[0]
+            dob_candidate = candidates.get("dob")
+            if (
+                dob_candidate is not None
+                and dob_candidate.bounding_box is not None
+                and only_w.y > dob_candidate.bounding_box.y
+            ):
+                claim("sex_2", [only_w], only_value, only_value, note=suggestion_note(only_sugg))
+            else:
+                claim("sex_1", [only_w], only_value, only_value, note=suggestion_note(only_sugg))
+            genders = []
         if genders:
             w, value, sugg = genders[0]
             claim("sex_1", [w], value, value, note=suggestion_note(sugg))
@@ -695,25 +729,51 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # wrongly steal this N.A as if it were Alcoholic, corrupting both
         # fields at once (verified: this was exactly why Alcoholic was
         # coming back "N.A" instead of the flags' own real first answer).
-        blood = self._match_single_token_enum(words, consumed, pat.BLOOD_GROUP_VALUES, cutoff=0.6)
-        if not blood:
+        # Deterministic corrections run BEFORE the fuzzy match below, not
+        # after: a word like "A+?" already clears the fuzzy cutoff (0.6)
+        # on its own, so gating these on "fuzzy match failed" would never
+        # actually run for the dominant real case - the fuzzy path would
+        # claim it first and store the noisy raw text with just a
+        # suggestion note (same as the "0"->"O" case before this fix was
+        # reordered).
+        blood: tuple[OCRWord, str, str | None] | None = None
+        for w in words:
+            if id(w) in consumed:
+                continue
             # Verified against real ground-truth data: Azure sometimes
             # prints the blood-type letter "O" as digit "0" (a classic OCR
             # confusable) - e.g. raw token "0+" where the real value must
             # be "O+" (no blood type can contain a literal zero; this is a
             # closed 8-value vocabulary, so there's no ambiguity about what
-            # "0+"/"0-" actually means). The default fuzzy cutoff (0.6)
-            # doesn't catch this specific single-character substitution, so
-            # it's checked directly rather than loosening the cutoff
-            # generally (which would risk confusing different blood types
-            # with each other, e.g. "A+" with "B+").
-            for w in words:
-                if id(w) in consumed:
-                    continue
-                corrected = w.text.replace("0", "O")
-                if corrected in pat.BLOOD_GROUP_VALUES:
-                    blood = (w, corrected, None)
+            # "0+"/"0-" actually means).
+            corrected = w.text.replace("0", "O")
+            if corrected in pat.BLOOD_GROUP_VALUES:
+                blood = (w, corrected, None)
+                break
+            # A trailing OCR noise character glued onto an otherwise clean,
+            # unambiguous blood type (e.g. "A+?", "A+7", "AB++") is the
+            # dominant invalid-value shape for this field in the November
+            # dump (confirmed: ~90% of invalid blood_group values fit this
+            # exact pattern). Unlike Medicine's "XANA,X" (explicitly
+            # verified against a golden legacy reference to NOT be
+            # auto-corrected, since that shape can genuinely mean a
+            # different, distinct garbled reading), a blood type has only
+            # 8 possible values total with no real ambiguity once a clean
+            # prefix match is found - stripping 1-2 trailing characters to
+            # recover one is the same deterministic-substitution precedent
+            # as the "0"->"O" case just above, not a new kind of guess.
+            for strip in (1, 2):
+                prefix = w.text[:-strip] if strip < len(w.text) else ""
+                if len(prefix) >= 2 and prefix.upper() in pat.BLOOD_GROUP_VALUES:
+                    blood = (w, prefix.upper(), None)
                     break
+            if blood:
+                break
+        if not blood:
+            # The default fuzzy cutoff (0.6) catches everything else this
+            # schema's real OCR noise produces that isn't one of the two
+            # deterministic shapes above.
+            blood = self._match_single_token_enum(words, consumed, pat.BLOOD_GROUP_VALUES, cutoff=0.6)
         flag_run = self._find_flag_run(words, consumed, self.layout)
         if blood:
             w, value, sugg = blood
@@ -789,7 +849,14 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             )
 
         # --- card name (payment card type vocabulary) ---
-        card_match = self._match_multiword_enum(words, consumed, pat.CARD_TYPES, max_window=3)
+        # Window widened 3->4: CARD_TYPES itself has 4-word entries
+        # ("AMERICAN EXPRESS GREEN CARD", "AMERICAN EXPRESS PLATINUM
+        # CARD") that a 3-word cap could never reach - confirmed the
+        # dominant card_name failure in the November-dump sample
+        # (31 of 60 invalid instances): the search (largest window first)
+        # was truncating both to "American Express Green"/"... Platinum",
+        # one word short, instead of ever trying the full 4-word match.
+        card_match = self._match_multiword_enum(words, consumed, pat.CARD_TYPES, max_window=4)
         if card_match:
             mw, value, sugg = card_match
             # Verified against real ground-truth data: the following
@@ -859,6 +926,23 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # noise (see _extract_currency_fields docstring) and so is a much
         # less stable anchor on its own.
         currency_anchor = date_positions[-1] if len(date_positions) > 1 else dosage_pos
+        # Real, confirmed bug (November dataset, 752.jpeg record 29610274):
+        # when only 2 distinct dates are found, date_positions[-1] is
+        # D_B_Life_Assure's OWN date (not DOB - DOB was genuinely blank on
+        # this record), which prints on the SAME line as, and just BEFORE,
+        # P_Inst's own dollar value. Anchoring there put P_Inst's "$250.00"
+        # into the tail group instead of head, shifting Pill Rate/Cost/
+        # Shipping Cost/Total Amount each one slot out of place too (the
+        # same cascade already fixed elsewhere for the 5-flag run). Taking
+        # the later of the two available signals is strictly safer than
+        # either alone: dosage_pos, when actually found, sits right at the
+        # Medicine/Dosage block - always structurally after P_Inst - so it
+        # can only correct an anchor that's too early, never push a correct
+        # one later than the real boundary.
+        if dosage_pos is not None and currency_anchor is not None:
+            currency_anchor = max(currency_anchor, dosage_pos)
+        elif dosage_pos is not None:
+            currency_anchor = dosage_pos
         self._extract_currency_fields(text, spans, consumed, candidates, currency_anchor)
 
         # --- tablets: standalone integer near dosage ---
@@ -869,8 +953,42 @@ class RuleBasedExtractionEngine(ExtractionEngine):
 
         # --- policy_no / stm_code: hash-shaped codes, first then second ---
         hashes = self._extract_hash_codes(text, spans, consumed, self.layout)
+        # Policy No always prints AFTER the 5-flag run in this schema
+        # (Alcoholic..Allergiesd, PloicyNo, ...) - a hash-shaped match
+        # positioned BEFORE it can only be a false positive from an
+        # unrelated glued OCR word (confirmed real, DataM (4).xml record
+        # 29610265: the email "realty4u@msn.comRr1" glues a stray code-
+        # shaped suffix onto itself, which HASH_CODE's own shape rules
+        # can't tell apart from a real code). Left unfiltered, that
+        # earlier false match took the policy_no slot (hashes[0]) and
+        # bumped the REAL policy_no into stm_code's slot instead - the
+        # same off-by-one cascade already seen elsewhere in this file,
+        # just from a different root cause. Verified against 8 of 9
+        # traced real cases from the November dump; the reading-order
+        # anchor itself (flag_run's own end position) reuses the same
+        # precedent already trusted for Blood Group/PhNo_2 just above.
+        if flag_run:
+            flags_end = (flag_run[-1][0].line_num, flag_run[-1][0].x)
+            hashes = [
+                h for h in hashes
+                if not h[0] or min((w.line_num, w.x) for w in h[0]) > flags_end
+            ]
         stm_code_start_key: tuple[int, int] | None = None
         policy_no_start_key: tuple[int, int] | None = None
+        # NOTE: tried routing a lone hash candidate to stm_code (instead
+        # of the default policy_no) whenever it matched the common
+        # "aC"-family shape (01aCm/01aCp/OlaCn etc) that most real
+        # STM_Code values share - measured against DataM (4).xml: fixed
+        # several genuine lone-stm_code cases (e.g. record 29610264,
+        # where Policy No's own value was invisible to HASH_CODE due to
+        # a non-ASCII OCR substitution) but caused a larger number of new
+        # regressions, because a real, confirmed minority of Policy No
+        # values ALSO use this exact shape family (e.g. GT PolicyNo
+        # "OlaCo-13462", "XX_OlaCp_21848", "B.alX,_OlaCm-8839" on records
+        # 29610340/29610306/29610348) - net effect was flat-to-negative
+        # on the full ground-truth comparison. Reverted; no reliable
+        # content-only signal was found to distinguish the two fields
+        # when only one candidate exists.
         if hashes:
             mw, value = hashes[0]
             claim("policy_no", mw, value, value)
@@ -928,7 +1046,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
 
     @staticmethod
     def _match_all_single_token_enum(
-        words: list[OCRWord], consumed: set[int], vocabulary: set[str]
+        words: list[OCRWord], consumed: set[int], vocabulary: set[str], cutoff: float = 0.8
     ) -> list[tuple[OCRWord, str, str | None]]:
         """Like _match_single_token_enum but returns every match, in reading
         order. Used for fields that appear twice per record (Sex_1/Sex_2,
@@ -974,7 +1092,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                     continue
                 match = w.text.upper() if w.text.upper() in vocabulary else None
             else:
-                match = closest_enum_match(w.text, vocabulary, cutoff=0.8)
+                match = closest_enum_match(w.text, vocabulary, cutoff=cutoff)
             if match:
                 suggestion = match if match.upper() != w.text.upper() else None
                 found.append((w, w.text, suggestion))
@@ -1004,17 +1122,22 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             by_line.setdefault(w.line_num, []).append(w)
 
         def _looks_like_zip(text: str) -> bool:
-            # NEW-LAYOUT ONLY: tolerant of a single OCR-garbled character
-            # (e.g. "7200?11" for what's almost certainly a real zip with
-            # one misread digit) rather than requiring pat.ZIP_CODE's exact
-            # clean fullmatch - verified directly: a real state match
-            # ("VA") was being rejected and un-consumed here, promoting the
-            # WRONG state (from a different line entirely) to State_1,
-            # purely because its own real zip had one garbled character
-            # and so never fullmatched ZIP_CODE at all. Old layout keeps
-            # the original strict fullmatch unconditionally.
-            if layout != "new":
-                return bool(pat.ZIP_CODE.fullmatch(text))
+            # Tolerant of OCR-garbled characters (e.g. "7200?11" for what's
+            # almost certainly a real zip with one misread digit) rather
+            # than requiring pat.ZIP_CODE's exact clean fullmatch -
+            # verified directly (originally new-layout data: a real state
+            # match ("VA") was being rejected and un-consumed here,
+            # promoting the WRONG state from a different line to State_1,
+            # purely because its own real zip had a garbled character and
+            # so never fullmatched ZIP_CODE). Confirmed the identical
+            # failure in old-layout November-dump data too (e.g. a genuine
+            # "CA" rejected over a badly garbled zip, which then let a
+            # same-shaped word from the record's SECOND address block get
+            # mistaken for State_1, leaving City_2/State_2/Zip_2 all blank)
+            # - no longer gated to new layout, since the underlying cause
+            # (OCR sometimes garbles a zip) isn't layout-specific.
+            if pat.ZIP_CODE.fullmatch(text):
+                return True
             if not (3 <= len(text) <= 10):
                 return False
             digit_count = sum(ch.isdigit() for ch in text)
@@ -1024,15 +1147,16 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         for w, value, suggestion in matches:
             same_line = sorted(by_line.get(w.line_num, []), key=lambda x: x.x)
             later = [o for o in same_line if o.x > w.x]
-            # NEW-LAYOUT ONLY (the N.A/N/A allowance): a real state slot is
-            # just as validly followed by an explicit "N.A"/"N/A"
-            # placeholder as by an actual zip - verified directly (e.g.
-            # "...Linvillet ARKANSAS FL N.A US..."): zip_2 itself is
-            # blank/not-applicable for this record, and the genuine state
-            # match "FL" was being rejected here purely because nothing
-            # zip-shaped followed it, when the real explanation is just
-            # that there's no real zip to find at all.
-            na_ok = layout == "new" and later and later[0].text.upper() in ("N.A", "N/A")
+            # A real state slot is just as validly followed by an explicit
+            # "N.A"/"N/A" placeholder as by an actual zip - verified
+            # directly (e.g. "...Linvillet ARKANSAS FL N.A US..."): zip_2
+            # itself is blank/not-applicable for this record, and the
+            # genuine state match "FL" was being rejected here purely
+            # because nothing zip-shaped followed it, when the real
+            # explanation is just that there's no real zip to find at all.
+            # Not layout-specific - confirmed the same N.A-as-zip pattern
+            # in old-layout data too.
+            na_ok = bool(later) and later[0].text.upper() in ("N.A", "N/A")
             if not later or (
                 (na_ok or _looks_like_zip(later[0].text))
                 and later[0].x - w.right <= max(w.height, later[0].height) * 4
@@ -1502,7 +1626,20 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             # answer invisible. Safe for "N.A" too: stripped to "NA",
             # already a distinct accepted member of YES_NO_NA_VALUES
             # itself, not a new fuzzy match.
-            stripped = w.text.replace(".", "")
+            # Leading/trailing quote, backtick and backslash characters
+            # also stripped - a confirmed recurring OCR artifact around
+            # "YES" specifically (753.jpeg record 29610284: raw token
+            # '"YES\' for Smoker, ratio 0.75 against "YES", just under
+            # the 0.85 cutoff - independently corroborated by ground
+            # truth's own OCR pass showing the identical noise shape,
+            # e.g. "'YES\\", on other records). None of these characters
+            # can ever be part of a real YES/NO/N.A answer, so stripping
+            # them is a deterministic cleanup, not a fuzzy guess. Left
+            # unrecovered, this single noisy word broke the run right
+            # after its first match and silently shifted every
+            # subsequent flag (Alcoholic through Allergies) onto the
+            # wrong field name instead of just losing one.
+            stripped = w.text.replace(".", "").strip("'\"`\\")
             match = closest_enum_match(stripped, pat.YES_NO_NA_VALUES, cutoff=0.85)
             if not match and stripped.upper() == "NOT":
                 # A confirmed real, recurring OCR misread of "NO" (62
@@ -1537,10 +1674,37 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 suffix_match = re.search(r"\d(YES|N\.?A\.?|NO)$", stripped, re.IGNORECASE)
                 if suffix_match:
                     match = closest_enum_match(suffix_match.group(1), pat.YES_NO_NA_VALUES, cutoff=0.85)
+            if not match and len(current) >= 2:
+                # Already 2+ confirmed flag answers immediately before this
+                # word in reading order - OCR garbles a flag token badly
+                # enough to miss every recovery above often enough to
+                # matter (confirmed real variants: "NOE", "NOI", "~YnO",
+                # all meant to read "NO") and, left unrecovered, breaks the
+                # run right before the end, silently losing the trailing
+                # flags even though the row position makes this word
+                # unambiguously the next answer, not unrelated text. A
+                # much looser cutoff is safe ONLY in this exact context -
+                # continuing an already-established run of 2+ confirmed
+                # matches, immediately next in reading order - unlike
+                # scanning the whole page for any similarly-shaped word
+                # (tried for Sex_2 and reverted: that produced far more
+                # false positives than it recovered, since nothing already
+                # anchors which word SHOULD be the answer). Here the
+                # schema itself guarantees this position holds a flag
+                # answer; the only question is which one.
+                match = closest_enum_match(stripped, pat.YES_NO_NA_VALUES, cutoff=0.6)
             same_line = prev_line is None or w.line_num == prev_line
-            wraps_run = (
-                layout == "new" and not same_line and bool(current) and id(w) in leftmost_ids
-            )
+            # Confirmed the identical wrapped-run pattern in old-layout
+            # November-dump data too (not new-layout-specific after all -
+            # same conclusion already reached twice elsewhere in this file
+            # for the hash-code-split and garbled-zip cases): a record's
+            # flag run regularly wraps mid-run onto the next physical
+            # line, e.g. "...879-2312 NO YES NO\nNO NO Zc_Bqn..." - the
+            # strict same-line requirement broke the run right there,
+            # costing the trailing flags (Diabetic, Allergies) even
+            # though the wrap is unambiguous (leftmost word, immediately
+            # continuing the run).
+            wraps_run = not same_line and bool(current) and id(w) in leftmost_ids
             # A token that's ENTIRELY periods (stripped to nothing) is the
             # other half of the same real bug: OCR sometimes splits one
             # garbled flag token into a bare "." plus the rest ("N.O.")
@@ -1877,7 +2041,16 @@ class RuleBasedExtractionEngine(ExtractionEngine):
     # single-space version above didn't anticipate. The optional leading
     # [.,=_-]{0,2} consumes that dangling same-word punctuation before
     # the cross-word part starts.
-    _CROSS_WORD_BRIDGE = re.compile(r"[.,=_-]{0,2} [.,=_-]{1,3} \d{2,6}\b")
+    # Real, confirmed bug (DataM (4).xml, 751.jpeg record 29610259):
+    # "B.alX,_OlaCn" + "=-" (same line, real space) + "70755" (the SAME
+    # trailing digit fragment, but wrapped onto the NEXT physical line as
+    # its first word - build_indexed_text joins a line change with "\n",
+    # not " ", so the literal-space version matched the first gap but not
+    # the second, leaving the whole code unrecovered). Each gap now
+    # independently accepts either separator - the same "either is fine,
+    # as long as it's immediately next in reading order" tolerance
+    # already established for the 5-flag run's own cross-line wrap.
+    _CROSS_WORD_BRIDGE = re.compile(r"[.,=_-]{0,2}[ \n][.,=_-]{1,3}[ \n]\d{2,6}\b")
 
     # Unlike the ambiguous per-instance O/0 and I/l confusables elsewhere in
     # this code family (where the SAME rendered character is genuinely a
@@ -1916,8 +2089,15 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             # contains at least one digit somewhere; a period-joined name
             # never does - reject matches with no digit at all rather than
             # loosen the shared regex itself.
-            if not any(ch.isdigit() for ch in m.group(0)):
-                continue
+            # Deferred to after the glued/bridge extensions below (was
+            # "continue" here) - real, confirmed bug (DataM (4).xml,
+            # 751.jpeg record 29610259): "B.alX,_OlaCn" has no digit at
+            # all in the BASE match (its own trailing digits "70755" are
+            # a separate OCR word, recovered only by the cross-word-
+            # bridge logic further down) - rejecting here, before that
+            # recovery ever runs, discarded the whole code even though
+            # the complete, digit-bearing value was fully recoverable.
+            has_base_digit = any(ch.isdigit() for ch in m.group(0))
             # The second HASH_CODE alternative (no punctuation separator)
             # has no real code-shape requirement beyond "has upper, lower,
             # and a digit-letter transition somewhere in 8-14 chars" - that
@@ -1940,6 +2120,21 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 digit_count = sum(ch.isdigit() for ch in m.group(0))
                 if digit_count / len(m.group(0)) < 0.3:
                     continue
+            # A real Policy No/STM Code is always a one-off value in this
+            # schema - it never repeats elsewhere in the same record. A
+            # synthetic customer-name fragment that happens to satisfy
+            # HASH_CODE's shape (confirmed real: "angel_5200", density
+            # 40% - well above the digit-density guard above, which can't
+            # catch it) typically DOES repeat, since Customer Name,
+            # Billing Name, and Name_P_Holder are frequently identical
+            # copies of each other per this form's own rules - "angel_5200"
+            # appeared 3 separate times in one real record this was traced
+            # from, wrongly consumed as the code and cascading into STM
+            # Name losing its anchor entirely. Catches both branches, not
+            # just the no-punctuation one, since the false positive here
+            # used the punctuated branch (via its own "_").
+            if text.count(m.group(0)) > 1:
+                continue
             end = m.end()
             # Verified against 5 dev-set examples (e.g. "BaX_01acM_9548" +
             # "11/23/1952" glued with no separator at all, read as
@@ -2045,24 +2240,41 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                         )
                     ):
                         start = s2
-            # NEW-LAYOUT ONLY: mirror image of the leading-fragment case -
-            # the code's own trailing digits sometimes land as a separate
-            # word after a real space instead of glued (e.g. "Zc_Bqn,
-            # 3140", ground truth "Zc_Bqn,_3140") - unlike the glued
-            # trailing-suffix case above, _CROSS_WORD_BRIDGE doesn't span a
-            # real space. Restricted to a bare digit run (the only shape
-            # actually observed trailing like this) gluing onto a
-            # complete, independently-valid HASH_CODE match, for the same
-            # false-positive reasoning as the leading case.
-            if layout == "new" and end < len(text) and text[end] == " ":
-                next_span = next((s for s in spans if s[0] == end + 1), None)
+            # Mirror image of the leading-fragment case - the code's own
+            # trailing portion sometimes lands as a separate word after a
+            # real space instead of glued (e.g. "Zc_Bqn, 3140", ground
+            # truth "Zc_Bqn,_3140") - unlike the glued trailing-suffix case
+            # above, _CROSS_WORD_BRIDGE doesn't span a real space.
+            # Originally restricted to a bare digit run and new-layout
+            # only; widened to any next word on BOTH layouts after direct
+            # ground-truth comparison (DataM (4).xml) found the identical
+            # pattern in old-layout data with a non-digit trailing
+            # fragment too (e.g. "B.alX,_0," + "lack-37232" - ground truth
+            # "B.a1X,_0,1acM-37232" - the first word alone already
+            # satisfies HASH_CODE on its own, so the match stopped there
+            # and silently dropped the rest of the code, repeated across 5
+            # separate records). Still only extends when gluing produces a
+            # complete, independently-valid HASH_CODE match - the same
+            # self-validating safety net every other extension in this
+            # function relies on, not a blind word grab.
+            # HASH_CODE's own trailing \b means the match itself can never
+            # include a trailing separator char that's immediately
+            # followed by a space (non-word -> non-word is never a \b) -
+            # confirmed directly: "B.alX,_0," (the complete OCR word,
+            # ending in a comma) only ever matches as far as "B.alX,_0",
+            # one character short, leaving that trailing comma as
+            # text[end] instead of the space this check originally
+            # assumed. Skipped over (not required to be a separator
+            # itself - just whatever's left of THIS word) before looking
+            # for the following space + word.
+            bridge_end = end
+            while bridge_end < len(text) and text[bridge_end] != " " and text[bridge_end] != "\n":
+                bridge_end += 1
+            if bridge_end < len(text) and text[bridge_end] == " ":
+                next_span = next((s for s in spans if s[0] == bridge_end + 1), None)
                 if next_span is not None:
                     s3, e3, w3 = next_span
-                    if (
-                        id(w3) not in consumed
-                        and w3.text.isdigit()
-                        and HASH_CODE.fullmatch(text[start:end] + w3.text)
-                    ):
+                    if id(w3) not in consumed and HASH_CODE.fullmatch(text[start:bridge_end] + w3.text):
                         end = e3
             mw = [w for w in words_in_span(spans, start, end) if id(w) not in consumed]
             if mw:
@@ -2079,7 +2291,8 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 value = re.sub(r"\s*([,\-_.=])\s*", r"\1", value)
                 if layout == "new":
                     value = RuleBasedExtractionEngine._normalize_known_code_confusables(value)
-                found.append((m.start(), mw, value))
+                if has_base_digit or any(ch.isdigit() for ch in value):
+                    found.append((m.start(), mw, value))
 
         # NEW-LAYOUT ONLY: a code ending in a separator character with
         # no word-char after it (e.g. "Zc_Bqn,") can never satisfy
@@ -2108,6 +2321,140 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 value = re.sub(r"\s*([,\-_.=])\s*", r"\1", text[s1:e2])
                 value = RuleBasedExtractionEngine._normalize_known_code_confusables(value)
                 found.append((s1, [w1, w2], value))
+
+        # HASH_CODE's leading \b[A-Za-z] requires a LETTER as the very
+        # first character of the match - but this document family's
+        # "liB_..." STM Code prefix is routinely OCR'd with BOTH leading
+        # letters ("l", "i") misread as digit "1" ("11B_OaCN-1127" for
+        # the real "liB_OaCN-1127"), which makes the whole word invisible
+        # to the regex from the start, not just trimmed short - confirmed
+        # directly via ground-truth comparison (DataM (4).xml): the
+        # resulting code was missing entirely, which then also silently
+        # took STM Name down with it (no stm_code_start_key to anchor
+        # its own search). Restricted to this exact, confirmed 4-char
+        # template prefix (never a blanket "1 means l" substitution
+        # anywhere else, where a genuine digit "1" is common and
+        # expected) and still only accepted when doing so reproduces a
+        # complete, independently-valid HASH_CODE match.
+        for s, e, w in spans:
+            if id(w) in consumed or len(w.text) < 5 or w.text[:3] != "11B":
+                continue
+            corrected = "liB" + w.text[3:]
+            if HASH_CODE.fullmatch(corrected) and any(ch.isdigit() for ch in corrected):
+                found.append((s, [w], corrected))
+
+        # A stray "#" or "'" occasionally lands inside this family's own
+        # "FR-DLI09_..." Policy No prefix (confirmed real ground-truth
+        # values: "F#R'-DLI09_i4259", "FR-D'LI#I09_13741") - neither
+        # character is in HASH_CODE's own class, so the word fails to
+        # match AT ALL, not just trimmed short, and (as traced on a real
+        # record) the slot it should have filled was then wrongly taken
+        # by a DIFFERENT code found elsewhere, corrupting both Policy No
+        # and STM Code at once. Stripped only when doing so reproduces a
+        # complete, independently-valid HASH_CODE match - same
+        # self-validating guard as every other recovery here.
+        for s, e, w in spans:
+            if id(w) in consumed or not any(ch in "#'" for ch in w.text):
+                continue
+            stripped = w.text.replace("#", "").replace("'", "")
+            if HASH_CODE.fullmatch(stripped) and any(ch.isdigit() for ch in stripped):
+                found.append((s, [w], stripped))
+
+        # November-dump data regularly splits a Policy No/STM Code into
+        # SEVERAL separate OCR words with real spaces between them (not a
+        # glued-word artifact like the cases above - confirmed directly
+        # across many real records, e.g. "B.alX, _. 00laCo-5328" or
+        # "ZtAO, 9vB.894359" as 2-3 separate words). Unlike the glued
+        # cases, neither fragment can independently match HASH_CODE here:
+        # the piece right after the space routinely starts with a digit,
+        # and BOTH of HASH_CODE's alternatives require a leading letter -
+        # so finditer never finds an anchor to extend from, the code goes
+        # missing entirely, and a later trailing fragment (which DOES
+        # start with a letter, e.g. "OlaCp_24810") gets mistaken for a
+        # separate, independently-valid code and wrongly claimed as the
+        # FIRST one (Policy No) instead of being part of the second
+        # (STM Code) - i.e. this silently corrupts Policy No too, not
+        # just STM Code.
+        #
+        # Recovered generally, not by hardcoding this template's exact
+        # prefix spelling (would not generalize to other layouts/prefixes
+        # - see this module's own policy against per-template hardcoding):
+        # scans not-yet-claimed words in reading order, and for every run
+        # of up to 5 adjacent words on the same line within the same
+        # horizontal-gap contiguity threshold already used for city/name
+        # extraction elsewhere in this file, joins their text with NO
+        # space and requires the join to reproduce a complete,
+        # independently-valid HASH_CODE match (same digit/density
+        # safeguards as the main pass above) - exactly the same shape
+        # validation already trusted for every other code in this schema,
+        # so ordinary adjacent words that don't happen to join into that
+        # exact shape are never swept in.
+        claimed_so_far: set[int] = {id(w) for _, mw, _ in found for w in mw}
+        candidates = sorted(
+            ((s, w) for s, e, w in spans if id(w) not in consumed and id(w) not in claimed_so_far),
+            key=lambda sw: (sw[1].line_num, sw[1].x),
+        )
+        i = 0
+        while i < len(candidates):
+            run = [candidates[i]]
+            j = i + 1
+            while j < len(candidates) and len(run) < 5:
+                _, w = candidates[j]
+                _, prev_w = run[-1]
+                if w.line_num != prev_w.line_num:
+                    break
+                gap = w.x - prev_w.right
+                # 1.25x, matching _trailing_contiguous_run's own widening
+                # (see that function's comment) - confirmed via ground-
+                # truth comparison this run-builder has the identical
+                # too-tight-gap failure mode: "B.alX," + "_0" alone
+                # already passes HASH_CODE validation, so a 1.0x cutoff
+                # stopped the run right there instead of continuing to
+                # the real, longer code ("B.alX,_0,1acM-37232" etc,
+                # repeated truncation confirmed across 5 separate records).
+                if gap > max(w.height, prev_w.height) * 1.25:
+                    break
+                run.append(candidates[j])
+                j += 1
+            advanced = False
+            for length in range(len(run), 1, -1):
+                sub = run[:length]
+                joined = "".join(w.text for _, w in sub)
+                if not HASH_CODE.fullmatch(joined):
+                    continue
+                if not any(ch.isdigit() for ch in joined):
+                    continue
+                if not any(ch in ".,_-" for ch in joined):
+                    digit_count = sum(ch.isdigit() for ch in joined)
+                    if digit_count / len(joined) < 0.3:
+                        continue
+                # A multi-word join needs real evidence it's one broken-up
+                # code, not an accidental joint match of unrelated words -
+                # this dataset's own synthetic name fields routinely embed
+                # a digit AND an underscore (e.g. "ps_kanwar"), so digit
+                # presence alone isn't enough once several words are
+                # joined (confirmed false positive: "ps_kanwar" +
+                # "egg0517" + "waltre" -> "ps_kanwaregg0517waltre" passes
+                # every check above). Every real multi-word code observed
+                # carries at least one separator character PER WORD in
+                # the run (OCR tends to break these codes apart AT their
+                # own separator punctuation, not in the middle of a
+                # letter/digit run) - that false positive has only 1
+                # separator across 3 words and is correctly rejected,
+                # while every confirmed real case (e.g. "B.alX," + "_." +
+                # "00laCo-3574") clears this by a wide margin.
+                if length > 1:
+                    sep_count = sum(1 for ch in joined if ch in ".,_-")
+                    if sep_count < length:
+                        continue
+                mw = [w for _, w in sub]
+                found.append((sub[0][0], mw, joined))
+                claimed_so_far.update(id(w) for w in mw)
+                i += length
+                advanced = True
+                break
+            if not advanced:
+                i += 1
 
         found.sort(key=lambda item: item[0])
         results = []
@@ -2415,21 +2762,40 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         if not candidates:
             return []
         ordered = sorted(candidates, key=lambda w: (w.line_num, w.x))
+        # NOTE: tried a cross-line wrap allowance here (mirroring the
+        # 5-flag run's own precedent), gated to only fire when the
+        # run's leading word is leftmost on its own line - fixed the
+        # targeted case (STM Name "chhayag kprincess10" wrapping before
+        # STM Code's anchor on 752.jpeg record 29610274) but measured a
+        # much larger net regression on Shipper Name (63.6% -> 52.7%):
+        # its search window is noisier (leftover unconsumed text from
+        # other fields, per this function's own docstring), and the
+        # leftmost-word-on-next-line condition is satisfied far more
+        # often there by unrelated leading words ("joan.", "wan",
+        # "unitLani", address fragments) than by genuine wraps. Reverted;
+        # this shared helper's strict same-line boundary stays as the
+        # safer default for all three callers (Shipper Name, STM Name,
+        # City_2) rather than trading a worse field for a better one.
         run = [ordered[-1]]
         for w in reversed(ordered[:-1]):
             if w.line_num != run[0].line_num:
                 break
             gap = run[0].x - w.right
-            # Widened from 0.8x to 1.0x - same real, confirmed need as
-            # _find_name_run's identical widening (see that function's own
-            # comment): a genuine 2-word Shipper Name's real inter-word gap
-            # measured 12px against a 12px word height (ratio 1.0, exactly
-            # at the old cutoff's edge) in a real November-dataset record
-            # ("cherrylynne edikis") - each word was isolated instead of
-            # joined into one run, so the >=2 check downstream failed and
-            # Shipper Name came back blank even though its own search
-            # window WAS correctly computed by then.
-            if gap > max(w.height, run[0].height) * 1.0:
+            # Widened from 0.8x to 1.0x, then to 1.25x - same real,
+            # confirmed need as _find_name_run's identical widening (see
+            # that function's own comment): a genuine 2-word Shipper/STM
+            # Name's real inter-word gap measured 12px against a 12px word
+            # height (ratio 1.0, exactly at the old cutoff's edge) in one
+            # real record ("cherrylynne edikis"). Verified via direct
+            # ground-truth comparison (DataM (4).xml, November dump) that
+            # 1.0x was STILL too tight for two more real cases: "pymz
+            # tczyy" (gap 13px / height 11px, ratio 1.18) and "ankhhathor
+            # tchadb" (gap 12px / height 11px, ratio 1.09) - both were
+            # isolated into single-word runs, failing the >=2 check and
+            # falling through to an unbounded fallback that then grabbed
+            # unrelated text (confirmed: Card Name's own "Platinum Card"
+            # ended up as STM Name instead).
+            if gap > max(w.height, run[0].height) * 1.25:
                 break
             run.insert(0, w)
         return run[-max_count:]
@@ -2539,7 +2905,20 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             hash_candidates = [
                 k for k in (policy_no_start_key, stm_code_start_key) if k is not None and k > anchor
             ]
-            right_boundary = max(hash_candidates) if hash_candidates else None
+            # MIN, not MAX, of the valid candidates - confirmed via direct
+            # ground-truth comparison (DataM (4).xml) that MAX over-widens
+            # the window when BOTH Policy No and STM Code sit on the same
+            # later line as STM Name's own real value: the window then
+            # reaches straight past Shipper Name's true boundary and the
+            # trailing-run walk picks STM Name's text (closer to the
+            # window's far edge) instead, swapping the two fields' values.
+            # Safe against the ORIGINAL reason this used MAX (Policy No
+            # printed before Shipper Name's real value, in a different
+            # record/family): the `k > anchor` filter above already drops
+            # an out-of-order Policy No from `hash_candidates` entirely in
+            # that case, leaving only STM Code - MIN and MAX are identical
+            # on a single-element list, so that fix is untouched.
+            right_boundary = min(hash_candidates) if hash_candidates else None
         if right_boundary is not None:
             candidates_ship = [
                 w
@@ -2568,19 +2947,21 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 # period) - the original len>=2 guard still wrongly
                 # excluded this shape (confirmed via "Claude B. Vicars",
                 # record 241017, dev set).
-                # NEW-LAYOUT ONLY (the digit-allowance): same precedent and
-                # reasoning as _find_name_run's allow_alnum=True: real
-                # Shipper Name values in this schema sometimes embed digits
-                # too (e.g. "Rogertmoorec21", "Bohemian3", "Rmegyesijwmiller
-                # Cards4Uonline" - all confirmed real new-layout ground-truth
-                # values). The original letters-only class silently excluded
-                # every one of these from the candidate pool, leaving
-                # shipper_tokens empty and shipper_name entirely unclaimed.
-                # Old layout keeps the original letters-only class.
-                and re.fullmatch(
-                    r"[A-Za-z][A-Za-z0-9_.]*" if self.layout == "new" else r"[A-Za-z][A-Za-z_.]*",
-                    w.text,
-                )
+                # Same precedent and reasoning as _find_name_run's
+                # allow_alnum=True: real Shipper Name values in this schema
+                # sometimes embed digits (e.g. "Rogertmoorec21", "Bohemian3"
+                # - originally confirmed in new-layout ground truth). The
+                # original letters-only class silently excluded every one
+                # of these from the candidate pool, leaving shipper_tokens
+                # empty and Shipper Name entirely unclaimed. Confirmed the
+                # identical need in old-layout November-dump data too (not
+                # new-layout-specific after all): once City_2's own
+                # extraction was fixed to stop silently absorbing stray
+                # text, several records' real Shipper Name value turned out
+                # to be a single digit-laden synthetic token (e.g.
+                # "celis86"), which the letters-only class was rejecting
+                # outright, leaving the candidate pool empty.
+                and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.]*", w.text)
                 and w.text.upper() not in NOISE_TOKENS
                 and not (sum(ch.isalpha() for ch in w.text) >= 2 and w.text.isupper())
                 and w.text.lower() not in dup_name_tokens
@@ -2671,21 +3052,28 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 # to whatever real word was kept next and stop there,
                 # truncating the name. Aligned to the shipper filter's shape
                 # plus "&" (not needed by shipper, but confirmed needed here).
-                # NEW-LAYOUT ONLY (the digit-allowance): same fix as the
-                # shipper-name filter above, kept in sync per this
-                # function's own comment that the two filters are meant to
-                # be equivalent. Old layout keeps the original letters-only
-                # (plus "&") class.
-                and (
-                    w.text == "&"
-                    or re.fullmatch(
-                        r"[A-Za-z][A-Za-z0-9_.]*" if self.layout == "new" else r"[A-Za-z][A-Za-z_.]*",
-                        w.text,
-                    )
-                )
+                # Same digit-allowance fix as the shipper-name filter above
+                # (kept in sync per this function's own comment that the
+                # two filters are meant to be equivalent), and confirmed
+                # needed in old-layout November-dump data too for the same
+                # reason: real STM Name values in this schema are
+                # sometimes a single digit-laden synthetic token, which the
+                # original letters-only class rejected outright.
+                and (w.text == "&" or re.fullmatch(r"[A-Za-z][A-Za-z0-9_.]*", w.text))
                 and w.text.upper() not in NOISE_TOKENS
                 and not (sum(ch.isalpha() for ch in w.text) >= 2 and w.text.isupper())
                 and w.text.lower() not in dup_name_tokens
+                # Real, confirmed bug (DataM (4).xml records 29610288/
+                # 29610337/29610349): "Platinum Card"/"Dankort Card" -
+                # CARD Name's own fragments - are both Title-Case and
+                # alphabetic, so with no better candidate nearby they get
+                # swept into STM Name instead. "CARD" itself is never part
+                # of a real STM Name in this schema; excluding it (and any
+                # full CARD_TYPES phrase) is a vocabulary-based filter, the
+                # same precedent as the existing ALL-CAPS place-name and
+                # dup-name-token exclusions just above.
+                and w.text.upper() != "CARD"
+                and w.text.upper() not in pat.CARD_TYPES
             ]
             stm_tokens = self._trailing_contiguous_run(candidates_stm)
             # NEW-LAYOUT ONLY: same wrapped-line recovery as the
@@ -2718,7 +3106,12 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # and wrongly assigns it to stm_name too. Excluding the known
         # duplicate name's own tokens here, the same way the stm_code-
         # anchored path above already does.
-        secondary_words = [w for w in words if w.text.lower() not in dup_name_tokens]
+        secondary_words = [
+            w for w in words
+            if w.text.lower() not in dup_name_tokens
+            and w.text.upper() != "CARD"
+            and w.text.upper() not in pat.CARD_TYPES
+        ]
         secondary = self._find_name_run(secondary_words, consumed, allow_alnum=False)
         if secondary:
             mw2, value2, repeated2 = secondary

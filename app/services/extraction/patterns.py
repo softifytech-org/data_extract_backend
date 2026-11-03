@@ -208,6 +208,15 @@ STREET_SUFFIX_WORDS = {
     "ST", "STREET", "AVE", "AVENUE", "DR", "DRIVE", "RD", "ROAD", "LN", "LANE",
     "BLVD", "CIR", "CIRCLE", "CT", "COURT", "WAY", "PKWY", "PARKWAY",
     "TERRACE", "TER", "TRAIL", "PLACE", "PL", "LOOP", "SQUARE", "SQ", "VIEW",
+    # Not a street suffix in the literal sense, but plays the identical
+    # role for a P.O. Box address ("...P.O. BOX 696 Indianapolis" - BOX
+    # marks exactly where the address ends and the city begins, same as
+    # "AVE"/"ST" do for a street address). Confirmed real, high-impact
+    # bug via direct ground-truth comparison (November dump, 751.jpeg
+    # record 29610259): with "BOX" unrecognized, it was itself being
+    # picked as City_1 (an all-caps word on the same line) instead of
+    # the real city "Indianapolis" one word later.
+    "BOX",
 }
 # This document consistently OCRs a printed "E" as "I" in these suffix
 # words specifically (confirmed against real ground truth: "Drivi"=Drive,
@@ -250,6 +259,7 @@ CARD_TYPES = {
     "AMERICAN EXPRESS PLATINUM CARD",
     "MASTER CARD",
     "MASTERCARD",
+    "MAESTRO CARD",
     "VISA",
     "DISCOVER",
     "BANK",

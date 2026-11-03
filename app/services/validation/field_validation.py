@@ -67,8 +67,17 @@ def _valid_two_word_name(value: str) -> bool:
     # stays ~27-42% regardless of word count there), so this stricter rule
     # is intentionally scoped to just these two fields rather than folded
     # into the shared _valid_name used by the others.
+    # Each word allows digits too (not alpha-only) - the extraction side
+    # for these two fields already treats alphanumeric tokens as
+    # legitimate content (confirmed real ground-truth values like
+    # "Rogertmoorec21", and directly confirmed again via source-image
+    # inspection on the November dump: e.g. "anita310 houstondonald" is
+    # exactly what's printed), so rejecting them here only hid correct
+    # extractions behind an unrelated word-count rule, never caught a
+    # real extraction error (the round-7 analysis above is entirely
+    # about word COUNT, not character class).
     parts = value.split()
-    return len(parts) == 2 and all(p.isalpha() and len(p) >= 2 for p in parts)
+    return len(parts) == 2 and all(re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", p) and len(p) >= 2 for p in parts)
 
 
 def _valid_street_address(value: str) -> bool:

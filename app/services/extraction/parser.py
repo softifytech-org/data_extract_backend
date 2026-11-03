@@ -76,6 +76,19 @@ def normalize_date_numeric(month: str, day: str, year: str) -> str | None:
     try:
         return date(int(year), int(month), int(day)).isoformat()
     except ValueError:
+        pass
+    # D_B_Life_Assure specifically prints its date DD/MM/YYYY on this form,
+    # unlike D_Birth/DOB's MM/DD/YYYY (confirmed directly: real November-
+    # dump values like "15/08/1997", "30/09/1998", "23/11/1998" have a
+    # first number >12, impossible as a month, so the MM/DD reading above
+    # always rejected them outright and the field went blank even though
+    # OCR had read it correctly). Only ever reached when the MM/DD reading
+    # already failed, so this can never reinterpret an otherwise-valid
+    # MM/DD date (e.g. "06/10/1941") - it fires exclusively on dates that
+    # are unambiguously DD/MM, never a genuinely ambiguous one.
+    try:
+        return date(int(year), int(day), int(month)).isoformat()
+    except ValueError:
         return None
 
 
