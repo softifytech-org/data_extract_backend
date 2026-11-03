@@ -40,8 +40,13 @@ def _valid_phone(value: str) -> bool:
 
 
 def _valid_record_no(value: str) -> bool:
-    # BN_Workflow.pdf rule 2: strictly numeric, 5 or 6 digits.
-    return value.isdigit() and len(value) in (5, 6)
+    # BN_Workflow.pdf rule 2 documents 5-6 digits, but real data regularly
+    # runs 7-8 (see extraction/patterns.py's RECORD_ID_NUMERIC, already
+    # verified and extracting these correctly) - this validator was never
+    # updated to match, so it was flagging every correctly-extracted 7-8
+    # digit Record No as a format error. 5-8 matches what extraction
+    # already accepts as genuine, not a new/separately-invented bound.
+    return value.isdigit() and len(value) in (5, 6, 7, 8)
 
 
 def _valid_name(value: str) -> bool:
@@ -117,7 +122,10 @@ def _valid_gender(value: str) -> bool:
 
 
 def _valid_card_name(value: str) -> bool:
-    return value.upper() in pat.CARD_TYPES
+    # OCR regularly reads the space in "Master Card" as an underscore
+    # ("Master_Card") - same card, just a stray character, so strip it
+    # before comparing rather than flagging an otherwise-correct read.
+    return value.upper().replace("_", "") in pat.CARD_TYPES
 
 
 def _valid_medicine(value: str) -> bool:
