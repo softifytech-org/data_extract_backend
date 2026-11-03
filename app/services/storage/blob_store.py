@@ -121,12 +121,19 @@ class FileStore(ABC):
         gone."""
 
     @abstractmethod
-    def save_xml(self, data: bytes, *, batch_id: str) -> str:
+    def save_xml(self, data: bytes, *, batch_id: str, version: int | None = None) -> str:
         """Persists one batch's combined submission XML. Returns a storage
-        key. Always overwrites any existing XML for the same batch_id -
-        resubmitting a batch replaces its export with the current one,
-        never creates a second, inconsistent copy (see
-        app/api/batches.py's submit_batch)."""
+        key. With `version=None` (the default, used by every existing
+        caller), always overwrites the same "latest" key for this
+        batch_id - resubmitting a batch replaces that pointer with the
+        current export, which is what the existing single-shot download
+        endpoint reads. Passing a `version` instead writes to a SEPARATE,
+        version-specific key that is never touched again - this is what
+        app/api/batches.py's submit_batch additionally calls (alongside
+        the unversioned write) so each export's own content survives
+        later resubmits, satisfying "never overwrite a previous XML
+        export" at the storage layer, not just in the database record of
+        it (see AppDatabase.record_batch_export)."""
 
     @abstractmethod
     def read_xml(self, storage_key: str) -> bytes:
@@ -164,9 +171,9 @@ class LocalFileStore(FileStore):
     def delete_upload(self, storage_key: str) -> None:
         (self._uploads_dir / storage_key).unlink(missing_ok=True)
 
-    def save_xml(self, data: bytes, *, batch_id: str) -> str:
+    def save_xml(self, data: bytes, *, batch_id: str, version: int | None = None) -> str:
         self._submissions_dir.mkdir(parents=True, exist_ok=True)
-        name = f"{batch_id}.xml"
+        name = f"{batch_id}.xml" if version is None else f"{batch_id}-v{version}.xml"
         (self._submissions_dir / name).write_bytes(data)
         return name
 
@@ -240,8 +247,8 @@ class AzureBlobFileStore(FileStore):
         except Exception:  # noqa: BLE001 - best-effort cleanup only, never raises
             logger.warning("Could not delete orphaned blob %s during rollback", storage_key)
 
-    def save_xml(self, data: bytes, *, batch_id: str) -> str:
-        blob_name = f"{batch_id}.xml"
+    def save_xml(self, data: bytes, *, batch_id: str, version: int | None = None) -> str:
+        blob_name = f"{batch_id}.xml" if version is None else f"{batch_id}-v{version}.xml"
         _with_retries(
             f"Blob XML upload {blob_name}",
             lambda: self._blob(self._xml_container, blob_name).upload_blob(data, overwrite=True),

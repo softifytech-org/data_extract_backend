@@ -19,6 +19,8 @@ not just ones they created).
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from fastapi import APIRouter, Depends, Form, HTTPException, Response, UploadFile
 
 from app.core.config import Settings, get_settings
@@ -33,18 +35,32 @@ from app.core.security import (
 from app.core.logging_config import get_logger
 from app.models.document import AuditInfo, DocumentRecord, DocumentStatus, SourceFileInfo
 from app.schemas.batch import (
+    BatchArchiveResponse,
     BatchClearResponse,
+    BatchCompletionConfirmedResponse,
     BatchDetail,
+    BatchExportVersion,
     BatchImageStatus,
     BatchSubmissionStatus,
     BatchSubmitResponse,
     BatchSummary,
     BatchUploadResponse,
 )
+from app.services.batch_cleanup import clear_batch_data
 from app.services.export.dump_xml_export import submit_batch_records
 from app.services.storage.app_db import AppDatabase
 from app.services.storage.blob_store import FileStore, StorageUnavailableError
 from app.services.storage.json_storage import JsonDocumentRepository
+
+# How long a batch's working data (images, corrections, batch-tracking
+# rows) sticks around after the operator explicitly confirms completion,
+# before it's automatically cleaned up (see confirm_batch_completion below
+# and services/queue/worker.py's "cleanup_batch" job). Unfinished batches,
+# or ones whose export never succeeded, are structurally unreachable by
+# this - the job can only run once a real submission exists AND
+# completed_confirmed_at is set, which only confirm_batch_completion ever
+# sets.
+BATCH_RETENTION_HOURS = 24
 
 router = APIRouter(prefix="/api/batches", tags=["batches"])
 logger = get_logger(__name__)
@@ -68,6 +84,62 @@ def _get_batch_or_404(db: AppDatabase, batch_id: str) -> dict:
     if batch is None:
         raise HTTPException(status_code=404, detail="Batch not found")
     return batch
+
+
+def _enrich_image(i: dict, repo: JsonDocumentRepository) -> BatchImageStatus:
+    record_count = None
+    all_approved = None
+    if i["status"] in _PROCESSED_STATUSES:
+        record = repo.get(i["document_id"])
+        record_count = len(record.records)
+        all_approved = bool(record.records) and all(e.approved for e in record.records)
+    return BatchImageStatus(
+        position=i["position"], document_id=i["document_id"],
+        original_filename=i["original_filename"], status=i["status"], error=i["error"],
+        record_count=record_count, all_records_approved=all_approved,
+    )
+
+
+def _batch_progress(images: list[dict], repo: JsonDocumentRepository) -> tuple[int, int, int]:
+    """Returns (images_completed, records_total, records_completed) -
+    "completed" for an image means OCR finished (status in
+    _PROCESSED_STATUSES), for a record means approved. Used for both the
+    resume banner and the "ready to export" summary, so both read the
+    exact same numbers."""
+    images_completed = 0
+    records_total = 0
+    records_completed = 0
+    for i in images:
+        if i["status"] in _PROCESSED_STATUSES:
+            images_completed += 1
+            record = repo.get(i["document_id"])
+            records_total += len(record.records)
+            records_completed += sum(1 for e in record.records if e.approved)
+    return images_completed, records_total, records_completed
+
+
+# A batch not actively worked in this long is treated as PAUSED rather
+# than IN_PROGRESS - a judgment call, not a guess at operator intent:
+# there is no way to know from the backend alone whether someone is still
+# reading the screen, so this only distinguishes "touched very recently"
+# from "genuinely stepped away", matching the spec's own definition
+# ("has unfinished work but is not currently working on it").
+_PAUSED_AFTER_SECONDS = 600
+
+
+def _review_status(batch: dict, images: list[dict], db: AppDatabase, repo: JsonDocumentRepository) -> str:
+    if batch["archived"]:
+        return "archived"
+    if db.get_batch_submission(batch["id"]) is not None:
+        return "exported"
+    if images and not _batch_submission_blockers(images, repo):
+        return "ready_for_export"
+    last_worked_at = batch["last_worked_at"]
+    if last_worked_at:
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(last_worked_at)
+        if age.total_seconds() < _PAUSED_AFTER_SECONDS:
+            return "in_progress"
+    return "paused"
 
 
 @router.post("", response_model=BatchUploadResponse)
@@ -187,17 +259,31 @@ async def create_batch(
 
 
 @router.get("", response_model=list[BatchSummary])
-def list_batches(db: AppDatabase = Depends(get_app_db)) -> list[BatchSummary]:
+def list_batches(
+    archived: bool = False,
+    db: AppDatabase = Depends(get_app_db),
+    repo: JsonDocumentRepository = Depends(get_repository),
+) -> list[BatchSummary]:
     """No per-caller scoping - returns every batch ever created, by
-    anyone (see the module docstring: there is no identity to scope by)."""
+    anyone (see the module docstring: there is no identity to scope by).
+    `archived` defaults to False (existing callers that don't pass it see
+    exactly the active-batch list they always have) - pass true to list
+    the archived ones instead, for the Completed/Archived Batches view."""
     rows = db.list_batches(PUBLIC_OWNER_ID)
-    return [
-        BatchSummary(
-            id=r["id"], status=r["status"], image_count=r["image_count"],
-            created_at=r["created_at"], updated_at=r["updated_at"],
+    result = []
+    for r in rows:
+        if bool(r["archived"]) != archived:
+            continue
+        images = db.list_batch_images(r["id"])
+        result.append(
+            BatchSummary(
+                id=r["id"], status=r["status"], image_count=r["image_count"],
+                created_at=r["created_at"], updated_at=r["updated_at"],
+                review_status=_review_status(r, images, db, repo), archived=bool(r["archived"]),
+                completed_confirmed_at=r["completed_confirmed_at"],
+            )
         )
-        for r in rows
-    ]
+    return result
 
 
 _PROCESSED_STATUSES = ("completed", "needs_review")
@@ -209,30 +295,15 @@ def get_batch(
 ) -> BatchDetail:
     batch = _get_batch_or_404(db, batch_id)
     images = db.list_batch_images(batch_id)
-
-    def _enrich(i: dict) -> BatchImageStatus:
-        record_count = None
-        all_approved = None
-        # Only read the document's record file once OCR has actually
-        # produced records - reading it earlier would just report
-        # "0 records, not approved" for a still-queued image, which looks
-        # identical to a genuinely empty/broken one. Keeping both null
-        # until then is what lets the frontend tell "not reviewable yet"
-        # apart from "reviewed and has zero records".
-        if i["status"] in _PROCESSED_STATUSES:
-            record = repo.get(i["document_id"])
-            record_count = len(record.records)
-            all_approved = bool(record.records) and all(e.approved for e in record.records)
-        return BatchImageStatus(
-            position=i["position"], document_id=i["document_id"],
-            original_filename=i["original_filename"], status=i["status"], error=i["error"],
-            record_count=record_count, all_records_approved=all_approved,
-        )
+    images_completed, records_total, records_completed = _batch_progress(images, repo)
 
     return BatchDetail(
         id=batch["id"], status=batch["status"], image_count=batch["image_count"],
         created_at=batch["created_at"], updated_at=batch["updated_at"],
-        images=[_enrich(i) for i in images],
+        review_status=_review_status(batch, images, db, repo), archived=bool(batch["archived"]),
+        completed_confirmed_at=batch["completed_confirmed_at"],
+        images=[_enrich_image(i, repo) for i in images],
+        images_completed=images_completed, records_completed=records_completed, records_total=records_total,
     )
 
 
@@ -280,24 +351,15 @@ def remove_batch_image(
 
     updated_batch = _get_batch_or_404(db, batch_id)
     remaining = db.list_batch_images(batch_id)
-
-    def _enrich(i: dict) -> BatchImageStatus:
-        record_count = None
-        all_approved = None
-        if i["status"] in _PROCESSED_STATUSES:
-            rec = repo.get(i["document_id"])
-            record_count = len(rec.records)
-            all_approved = bool(rec.records) and all(e.approved for e in rec.records)
-        return BatchImageStatus(
-            position=i["position"], document_id=i["document_id"],
-            original_filename=i["original_filename"], status=i["status"], error=i["error"],
-            record_count=record_count, all_records_approved=all_approved,
-        )
+    images_completed, records_total, records_completed = _batch_progress(remaining, repo)
 
     return BatchDetail(
         id=updated_batch["id"], status=updated_batch["status"], image_count=updated_batch["image_count"],
         created_at=updated_batch["created_at"], updated_at=updated_batch["updated_at"],
-        images=[_enrich(i) for i in remaining],
+        review_status=_review_status(updated_batch, remaining, db, repo), archived=bool(updated_batch["archived"]),
+        completed_confirmed_at=updated_batch["completed_confirmed_at"],
+        images=[_enrich_image(i, repo) for i in remaining],
+        images_completed=images_completed, records_completed=records_completed, records_total=records_total,
     )
 
 
@@ -354,11 +416,20 @@ def submit_batch(
         )
 
     records = [repo.get(img["document_id"]) for img in images]
+    version = db.next_export_version(batch_id)
     try:
         combined_xml, total_records = submit_batch_records(
             records, settings.submissions_dir, settings.submissions_db_path
         )
-        xml_key = file_store.save_xml(combined_xml.encode("utf-8-sig"), batch_id=batch_id)
+        xml_bytes = combined_xml.encode("utf-8-sig")
+        # Two writes, same bytes: the unversioned key is the existing
+        # "latest" pointer re.submission/download already reads, kept
+        # exactly as before for backward compatibility; the versioned key
+        # is a separate, permanent copy this specific export's history
+        # row points to, so a LATER resubmit overwriting the unversioned
+        # key can never lose THIS export's own content.
+        xml_key = file_store.save_xml(xml_bytes, batch_id=batch_id)
+        versioned_key = file_store.save_xml(xml_bytes, batch_id=batch_id, version=version)
     except StorageUnavailableError as exc:
         logger.exception("Could not store combined XML for batch %s", batch_id)
         raise HTTPException(
@@ -366,7 +437,8 @@ def submit_batch(
         ) from exc
 
     db.upsert_batch_submission(batch_id, xml_key, file_store.name, total_records)
-    logger.info("Batch %s submitted (%d record(s), backend=%s)", batch_id, total_records, file_store.name)
+    db.record_batch_export(batch_id, version, versioned_key, file_store.name, total_records)
+    logger.info("Batch %s submitted (%d record(s), backend=%s, version=%d)", batch_id, total_records, file_store.name, version)
     return BatchSubmitResponse(batch_id=batch_id, records_submitted=total_records, status="submitted")
 
 
@@ -417,6 +489,116 @@ def download_batch_submission(
     )
 
 
+@router.post("/{batch_id}/confirm-completion", response_model=BatchCompletionConfirmedResponse)
+def confirm_batch_completion(
+    batch_id: str, db: AppDatabase = Depends(get_app_db)
+) -> BatchCompletionConfirmedResponse:
+    """The operator's EXPLICIT "I downloaded the XML, I'm done with this
+    batch" action (see frontend BatchPage's Start New Batch button - its
+    existing confirm dialog IS this confirmation, not a separate screen).
+    Requires a real submission to already exist: generating/downloading
+    the XML alone does not imply confirmation, and there is nothing to
+    confirm completion OF for a batch that was never actually submitted.
+
+    This is the ONLY thing that starts the 24h retention countdown
+    (BATCH_RETENTION_HOURS) - schedules exactly one cleanup_batch job via
+    the existing durable job queue (survives worker/process restarts the
+    same way process_image jobs already do), idempotent on retry (a
+    second confirm-completion call for the same batch reuses the first
+    confirmed_at and does not schedule a duplicate job - see
+    AppDatabase.confirm_batch_completion and the idempotency_key below).
+    """
+    _get_batch_or_404(db, batch_id)
+    submission = db.get_batch_submission(batch_id)
+    if submission is None:
+        raise HTTPException(
+            status_code=400,
+            detail="This batch has not been submitted yet - generate and download its XML before confirming completion.",
+        )
+    confirmed_at = db.confirm_batch_completion(batch_id)
+    job_id = db.enqueue_job(
+        job_type="cleanup_batch",
+        payload={"batch_id": batch_id},
+        idempotency_key=f"cleanup_batch:{batch_id}",
+        delay_seconds=BATCH_RETENTION_HOURS * 3600,
+    )
+    cleanup_scheduled_at = (
+        datetime.fromisoformat(confirmed_at) + timedelta(hours=BATCH_RETENTION_HOURS)
+    ).isoformat()
+    logger.info(
+        "Batch %s completion confirmed at %s - cleanup %s for %s",
+        batch_id, confirmed_at, "scheduled" if job_id else "already scheduled", cleanup_scheduled_at,
+    )
+    return BatchCompletionConfirmedResponse(
+        batch_id=batch_id, completed_confirmed_at=confirmed_at, cleanup_scheduled_at=cleanup_scheduled_at
+    )
+
+
+@router.get("/{batch_id}/exports", response_model=list[BatchExportVersion])
+def list_batch_exports(batch_id: str, db: AppDatabase = Depends(get_app_db)) -> list[BatchExportVersion]:
+    """Full, permanent export history for this batch (newest first) - see
+    AppDatabase.record_batch_export. Distinct from
+    get_batch_submission_status above, which only ever reports the single
+    latest one."""
+    _get_batch_or_404(db, batch_id)
+    return [
+        BatchExportVersion(version=e["version"], record_count=e["record_count"], exported_at=e["exported_at"])
+        for e in db.list_batch_exports(batch_id)
+    ]
+
+
+@router.get("/{batch_id}/exports/{version}/download")
+def download_batch_export_version(
+    batch_id: str, version: int, db: AppDatabase = Depends(get_app_db), settings: Settings = Depends(get_settings)
+) -> Response:
+    """Re-downloads one SPECIFIC past export version, byte-for-byte as it
+    was generated at the time - unlike /submission/download (the "latest"
+    endpoint), this is never affected by a later resubmit."""
+    _get_batch_or_404(db, batch_id)
+    exports = {e["version"]: e for e in db.list_batch_exports(batch_id)}
+    export = exports.get(version)
+    if export is None:
+        raise HTTPException(status_code=404, detail=f"No export version {version} for this batch")
+
+    from app.services.storage.blob_store import get_file_store_by_backend
+
+    file_store = get_file_store_by_backend(export["xml_storage_backend"], settings)
+    try:
+        data = file_store.read_xml(export["xml_storage_key"])
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="This export version is no longer available") from None
+    except StorageUnavailableError as exc:
+        logger.exception("Could not fetch export v%d for batch %s", version, batch_id)
+        raise HTTPException(status_code=502, detail="Could not retrieve this export version. Please try again.") from exc
+
+    return Response(
+        content=data, media_type="application/xml",
+        headers={
+            "Content-Disposition": f'attachment; filename="{batch_id}-v{version}.xml"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@router.post("/{batch_id}/archive", response_model=BatchArchiveResponse)
+def archive_batch(batch_id: str, db: AppDatabase = Depends(get_app_db)) -> BatchArchiveResponse:
+    """Hides the batch from the active workspace only - see
+    AppDatabase.archive_batch's own docstring for exactly what this does
+    and does not touch. No restriction on WHEN a batch can be archived
+    (an operator may want to archive an abandoned, never-submitted batch
+    too), unlike clear_batch which requires a real submission first."""
+    _get_batch_or_404(db, batch_id)
+    db.archive_batch(batch_id)
+    return BatchArchiveResponse(batch_id=batch_id, archived=True)
+
+
+@router.post("/{batch_id}/unarchive", response_model=BatchArchiveResponse)
+def unarchive_batch(batch_id: str, db: AppDatabase = Depends(get_app_db)) -> BatchArchiveResponse:
+    _get_batch_or_404(db, batch_id)
+    db.unarchive_batch(batch_id)
+    return BatchArchiveResponse(batch_id=batch_id, archived=False)
+
+
 @router.delete("/{batch_id}", response_model=BatchClearResponse)
 def clear_batch(
     batch_id: str,
@@ -449,25 +631,6 @@ def clear_batch(
             detail="This batch has not been submitted yet - submit and download its XML before clearing it.",
         )
 
-    images = db.list_batch_images(batch_id)
-    errors: list[str] = []
-    cleared = 0
-    for img in images:
-        document_id = img["document_id"]
-        label = f"position {img['position'] + 1} ({img['original_filename']})"
-        try:
-            record = repo.get(document_id)
-            file_store.delete_upload(record.source_file.stored_filename)
-        except Exception as exc:  # noqa: BLE001 - best-effort; report, don't abort the rest
-            errors.append(f"{label}: could not delete uploaded image - {exc}")
-            continue
-        try:
-            repo.delete(document_id)
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"{label}: could not delete stored record - {exc}")
-            continue
-        cleared += 1
-
-    db.delete_batch(batch_id)
+    cleared, errors = clear_batch_data(batch_id, db, repo, file_store)
     logger.info("Batch %s cleared (%d image(s), %d error(s))", batch_id, cleared, len(errors))
     return BatchClearResponse(batch_id=batch_id, images_cleared=cleared, errors=errors)

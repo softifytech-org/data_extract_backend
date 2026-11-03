@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.batches import ensure_public_user
 from app.api.batches import router as batches_router
+from app.api.devices import router as devices_router
 from app.api.documents import router as documents_router
 from app.core.config import get_settings
 from app.core.dependencies import get_app_db, get_repository
@@ -87,6 +88,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 
 app.include_router(documents_router)
 app.include_router(batches_router)
+app.include_router(devices_router)
 
 
 @app.get("/api/health")

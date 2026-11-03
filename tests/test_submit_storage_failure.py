@@ -29,7 +29,7 @@ class _SaveXmlAlwaysFails(LocalFileStore):
     write fails - simulating a real Azure Blob Storage outage without
     needing real Azure credentials."""
 
-    def save_xml(self, data: bytes, *, batch_id: str) -> str:
+    def save_xml(self, data: bytes, *, batch_id: str, version: int | None = None) -> str:
         raise StorageUnavailableError("simulated Blob Storage outage")
 
 

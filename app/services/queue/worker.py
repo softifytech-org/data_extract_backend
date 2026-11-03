@@ -7,10 +7,15 @@ job it doesn't finish (crash, restart, deploy) is picked back up by
 whichever worker claims it next (see AppDatabase.claim_next_job's stale-
 lock recovery).
 
-Only one job type exists today: "process_image", which wraps the existing,
-already-validated process_document() pipeline unchanged - this worker adds
+Two job types exist: "process_image", which wraps the existing, already-
+validated process_document() pipeline unchanged - this worker adds
 durability/retry/concurrency-control around that function, it does not
-reimplement OCR processing.
+reimplement OCR processing - and "cleanup_batch", the 24h-retention
+cleanup scheduled by app/api/batches.py's confirm_batch_completion
+endpoint (enqueue_job's delay_seconds is what makes a job not claimable
+until its scheduled time; this same claim_next_job/stale-lock machinery
+is what makes the delay survive a worker restart exactly as process_image
+retries already do).
 """
 from __future__ import annotations
 
@@ -21,10 +26,11 @@ from pathlib import Path
 from app.core.config import Settings
 from app.core.logging_config import get_logger
 from app.models.document import DocumentStatus
+from app.services.batch_cleanup import clear_batch_data
 from app.services.ocr.base import OCREngine
 from app.services.processing import process_document
 from app.services.storage.app_db import AppDatabase
-from app.services.storage.blob_store import get_file_store_by_backend
+from app.services.storage.blob_store import get_file_store_by_backend, get_write_file_store
 from app.services.storage.json_storage import JsonDocumentRepository
 
 logger = get_logger(__name__)
@@ -86,6 +92,8 @@ class BatchWorker:
         try:
             if job["job_type"] == "process_image":
                 await asyncio.to_thread(self._process_image_job, job["payload"])
+            elif job["job_type"] == "cleanup_batch":
+                await asyncio.to_thread(self._cleanup_batch_job, job["payload"])
             else:
                 raise ValueError(f"Unknown job type: {job['job_type']}")
             self._db.mark_job_succeeded(job["id"])
@@ -145,3 +153,56 @@ class BatchWorker:
             final_status = "needs_review" if record.status == DocumentStatus.NEEDS_REVIEW else "completed"
             self._db.update_batch_image_status(batch_id, position, final_status)
             self._db.recompute_batch_status(batch_id)
+
+    def _cleanup_batch_job(self, payload: dict) -> None:
+        """24h-retention cleanup, scheduled by confirm_batch_completion
+        (app/api/batches.py) via delay_seconds. Re-verifies the safety
+        conditions itself rather than trusting that scheduling it was
+        enough - this is the one place that actually deletes working
+        data, so it must not rely solely on "a job for this existed" as
+        proof those conditions still hold:
+
+        - The batch must still exist (a no-op, not an error, if it was
+          already cleared manually via DELETE /api/batches/{id} in the
+          meantime - clear_batch_data is naturally idempotent here since
+          delete_batch on an already-gone batch just deletes zero rows).
+        - It must have a real submission (get_batch_submission) - a batch
+          whose export failed or was never attempted can never reach this
+          state, since confirm_batch_completion itself refuses to run
+          without one.
+        - completed_confirmed_at must actually be set - defense in depth
+          against a job somehow existing without going through
+          confirm_batch_completion.
+
+        Archive status is deliberately NOT checked: an archived batch's
+        24h countdown runs exactly the same as an unarchived one (see
+        confirm_batch_completion's docstring and the product decision
+        behind it) - archiving only hides a batch from the active
+        workspace, it does not change retention."""
+        batch_id = payload["batch_id"]
+        batch = self._db.get_batch(batch_id)
+        if batch is None:
+            logger.info("cleanup_batch: batch %s no longer exists - nothing to do", batch_id)
+            return
+        if self._db.get_batch_submission(batch_id) is None:
+            logger.warning("cleanup_batch: batch %s has no submission - refusing to clean up", batch_id)
+            return
+        if not batch["completed_confirmed_at"]:
+            logger.warning("cleanup_batch: batch %s was never completion-confirmed - refusing to clean up", batch_id)
+            return
+
+        # Explicit self._settings, same reason _process_image_job uses
+        # get_file_store_by_backend(..., self._settings) instead of the
+        # globally-cached get_file_store(): that one only reads the REAL
+        # process-wide settings and FastAPI dependency_overrides can't
+        # reach a bare function call made outside the HTTP layer (see
+        # conftest.py's client fixture docstring for the exact same
+        # pitfall) - using the worker's own settings keeps this test-safe.
+        file_store = get_write_file_store(self._settings)
+        cleared, errors = clear_batch_data(batch_id, self._db, self._repo, file_store)
+        if errors:
+            logger.warning(
+                "cleanup_batch: batch %s cleaned up with %d error(s): %s", batch_id, len(errors), errors
+            )
+        else:
+            logger.info("cleanup_batch: batch %s cleaned up (%d image(s))", batch_id, cleared)
