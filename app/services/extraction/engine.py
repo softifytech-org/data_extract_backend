@@ -49,7 +49,13 @@ NOISE_TOKENS = {
 # real ground truth: most have a punctuation separator - including a leading
 # hyphen (e.g. "FR-DLI09_i14482", "Pi03-Ur_2048"), which the separator class
 # was missing even though the trailing continuation class already allowed
-# hyphens, so these were silently never matched at all. Policy No is also
+# hyphens, so these were silently never matched at all. "#" and "@" are two
+# more separator characters this same code family genuinely uses (confirmed
+# real, November dump USER 13/1.jpeg: "BaX#_0,1acM-36812", and separately
+# "Gyt@09_OPYu_t22911") - without them in the class, the regex can't even
+# begin a match at the code's own first character ("#"/"@" aren't letters,
+# digits, or in the old separator set), so the ENTIRE code was unmatched
+# whenever one of these sat before the first real separator. Policy No is also
 # sometimes a clean, punctuation-free mixed-case alphanumeric run (e.g.
 # "ZtA09vB8643", "N12aXp1990") that no separator-based pattern can match -
 # the second alternative requires upper+lower+digit all present in an 8-14
@@ -64,7 +70,7 @@ NOISE_TOKENS = {
 # transition keeps the real code shapes matching while excluding that name
 # shape.
 HASH_CODE = re.compile(
-    r"\b[A-Za-z][A-Za-z0-9]{0,4}[.,_-][A-Za-z0-9_.,-]{4,20}\b"
+    r"\b[A-Za-z][A-Za-z0-9]{0,4}[.,_#@-][A-Za-z0-9_.,#-]{4,20}\b"
     r"|\b(?=[A-Za-z0-9]{8,14}\b)(?=[A-Za-z0-9]*[a-z])(?=[A-Za-z0-9]*[A-Z])(?=[A-Za-z0-9]*\d[A-Za-z])"
     r"[A-Za-z][A-Za-z0-9]{7,13}\b"
 )
@@ -112,7 +118,18 @@ def _smart_join(words: list[OCRWord]) -> str:
     ordered = sorted(words, key=lambda w: (w.line_num, w.x))
     parts = [ordered[0].text]
     for prev, w in zip(ordered, ordered[1:]):
-        if w.x - prev.right >= 2:
+        # A line change always implies at least the space a wrap in the
+        # original layout would have had - two words from different
+        # printed lines were never glued with zero gap the way two same-
+        # line OCR fragments sometimes are. Without this, a value that
+        # legitimately wraps across lines (e.g. Shipper Name's second word
+        # starting the next printed line) silently lost its space -
+        # confirmed real (November dump, USER 06/1758.jpeg record 412942):
+        # "Pnorthripbarrygaw" (line 2) + "Dansullivan" (line 3) joined as
+        # "PnorthripbarrygawDansullivan", ground truth "Pnorthripbarrygaw
+        # Dansullivan". The x-gap check below is meaningless across lines
+        # anyway (prev.right and w.x belong to unrelated horizontal scales).
+        if w.line_num != prev.line_num or w.x - prev.right >= 2:
             parts.append(" ")
         parts.append(w.text)
     return "".join(parts)
@@ -386,6 +403,141 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             result.append(w)
         return result
 
+    # A name repeated across Customer Name/Billing Name/Name_P_Holder's 3
+    # printed occurrences (see _find_name_run) sometimes carries an extra
+    # trailing word that is ALSO printed 2-3 times (one synthetic
+    # "username-style" token per occurrence, e.g. "jed563"), but with NO
+    # space before whatever field happens to follow it on that particular
+    # occurrence's own row (Email Address / Shipper Name / STM Name -
+    # whichever the layout prints next). The OCR engine's own word
+    # segmentation then reads the trailing word and the following field as
+    # ONE glued token (e.g. "jed563moukie08@gmail.com"), so _find_name_run's
+    # exact-repeat check never sees a 3rd, trailing word at all - only the
+    # clean 2-word prefix forms a run, and the genuinely-repeated trailing
+    # word silently corrupts whatever field follows it instead. Confirmed
+    # real (November dump, USER 06/1758.jpeg record 412942): extraction read
+    # customer_name "Merlin Landon" (GT "Merlin Landon jed563"),
+    # email_address "jed563moukie08@gmail.com" (GT "moukie08@gmail.com"),
+    # shipper_name "jed563Pnorthripbarrygaw..." (GT "Pnorthripbarrygaw..."),
+    # stm_name "jed563Kenklee Skizard" (GT "Kenklee Skizard") - the exact
+    # same "jed563" prefix stolen three separate times by three otherwise
+    # unrelated fields.
+    #
+    # The glued prefix's own text can't be read off a single occurrence -
+    # there's no delimiter inside "jed563moukie08@gmail.com" marking where
+    # it ends - but when the SAME 2-4 word name run recurs with a DIFFERENT
+    # glued successor on 2+ of its occurrences, the successors' longest
+    # common prefix IS that boundary: "jed563moukie08@gmail.com",
+    # "jed563Pnorthripbarrygaw" and "jed563Kenklee" share nothing but
+    # "jed563" itself, since what follows it (an email address, a shipper
+    # name, an STM name) genuinely differs. Same repetition-as-evidence
+    # principle _find_name_run itself already relies on for the 2-word base
+    # name, applied one level deeper - not a guess at what the prefix means,
+    # just recognizing recurring boilerplate glued onto different content.
+    @staticmethod
+    def _split_glued_repeated_name_suffix(words: list[OCRWord]) -> list[OCRWord]:
+        word_like_re = re.compile(r"[A-Za-z][A-Za-z0-9_.]*")
+
+        def is_word_like(w: OCRWord) -> bool:
+            return (
+                len(w.text) >= 2
+                and w.text.upper() not in NOISE_TOKENS
+                and bool(word_like_re.fullmatch(w.text))
+            )
+
+        ordered = sorted(words, key=lambda w: (w.line_num, w.x))
+        runs: list[list[OCRWord]] = []
+        current: list[OCRWord] = []
+        prev_line = None
+        for w in ordered:
+            same_line = prev_line is None or w.line_num == prev_line
+            close_enough = (
+                not current or w.x - current[-1].right <= max(w.height, current[-1].height) * 1.0
+            )
+            if is_word_like(w) and same_line and close_enough:
+                current.append(w)
+            else:
+                current = [w] if is_word_like(w) else []
+            if 2 <= len(current) <= 4:
+                runs.append(list(current))
+            prev_line = w.line_num
+
+        counts: dict[tuple[str, ...], int] = {}
+        for run in runs:
+            key = tuple(x.text.upper() for x in run)
+            counts[key] = counts.get(key, 0) + 1
+        repeated_keys = {k for k, c in counts.items() if c >= 2}
+        if not repeated_keys:
+            return words
+        # Longest repeated phrase wins if more than one distinct phrase
+        # repeats - same tie-break _find_name_run itself uses.
+        best_key = max(repeated_keys, key=len)
+        occurrences = [run for run in runs if tuple(x.text.upper() for x in run) == best_key]
+
+        # The glued successor is NOT reliably distinguishable from an
+        # ordinary next word by its own shape or gap alone - verified
+        # directly against record 412942's raw OCR words: "Landon" sits a
+        # perfectly normal 7px (same scale as the run's own internal word
+        # gaps) from the next word on EVERY one of its 3 occurrences, and
+        # the glued word is itself pure alphanumeric (word-like) whenever
+        # the field it happened to fuse with has no punctuation of its own
+        # (a name/STM Name) - only an email's "@" makes some occurrences
+        # visibly non-word-like. So every occurrence's immediate next word
+        # on the same line is taken as a successor candidate regardless of
+        # shape or gap width; the LCP-length floor below (not gap or shape)
+        # is what rejects occurrences where the next word is genuinely
+        # unrelated.
+        run_word_ids = {id(w) for run in occurrences for w in run}
+        successors: list[OCRWord] = []
+        for run in occurrences:
+            run_end = run[-1]
+            same_line_after = [
+                w
+                for w in ordered
+                if w.line_num == run_end.line_num and w.x > run_end.x and id(w) not in run_word_ids
+            ]
+            if not same_line_after:
+                continue
+            successors.append(min(same_line_after, key=lambda w: w.x))
+
+        if len(successors) < 2:
+            return words
+
+        texts = [s.text for s in successors]
+        lcp = texts[0]
+        for t in texts[1:]:
+            i = 0
+            while i < len(lcp) and i < len(t) and lcp[i] == t[i]:
+                i += 1
+            lcp = lcp[:i]
+            if not lcp:
+                break
+        # A short/coincidental shared prefix isn't strong enough evidence (a
+        # single shared leading digit, say), and it must leave a real
+        # remainder in EVERY successor - otherwise there's nothing to split.
+        if len(lcp) < 4 or any(len(t) <= len(lcp) for t in texts):
+            return words
+
+        split_ids = {id(s) for s in successors}
+        result: list[OCRWord] = []
+        for w in words:
+            if id(w) in split_ids:
+                split_ratio = len(lcp) / len(w.text)
+                prefix_width = max(1, round(w.width * split_ratio))
+                result.append(w.model_copy(update={"text": lcp, "width": prefix_width}))
+                result.append(
+                    w.model_copy(
+                        update={
+                            "text": w.text[len(lcp):],
+                            "x": w.x + prefix_width,
+                            "width": max(1, w.width - prefix_width),
+                        }
+                    )
+                )
+            else:
+                result.append(w)
+        return result
+
     def extract(self, ocr_result: OCRPassResult) -> dict[str, FieldCandidate]:
         words = ocr_result.words
         text, spans = build_indexed_text(words)
@@ -434,6 +586,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # mismatch tracing, per "retain changes only when evidence
         # supports them, measured on held-out data, not the dev set alone."
         words = self._split_glued_state_suffixes(words)
+        words = self._split_glued_repeated_name_suffix(words)
         # NEW-LAYOUT ONLY: a date glued with no space to the following
         # field's own digits/dollar amount (e.g. "01/22/1959170") is a
         # dense wrapped-paragraph-layout artifact - no instance of it was
@@ -579,9 +732,38 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             filtered_countries = []
             for w, v, s in countries:
                 same_line = by_line.get(w.line_num, [])
+                earlier = [o for o in same_line if o.x < w.x]
                 later = [o for o in same_line if o.x > w.x]
                 if later and later[0].text.upper() in _HWY_WORDS and later[0].x - w.right <= max(w.height, later[0].height) * 4:
                     continue
+                # A genuine printed Country value in this schema is always
+                # ALL CAPS ("US"/"USA" - the same all-caps convention
+                # already established for city names elsewhere in this
+                # file); a LOWERCASE match sitting between two digit-shaped
+                # tokens on both sides is instead a coincidental mid-address
+                # token (e.g. a stray "us" inside a street address), not a
+                # genuine Country slot - a real address routinely has
+                # digits flanking ordinary text on both sides, but Country
+                # itself always sits next to text (email/address before,
+                # phone/sex after), never digits on both sides. Requiring
+                # the lowercase condition too (not digit-flanking alone)
+                # matters: digit-flanking alone is common and legitimate
+                # for a genuine Country_2 (Zip_2 before, PhNo_2 after) -
+                # measured a real regression trying that (country_2
+                # 92.6%->79.8% on the November-dump sample, genuine "US"
+                # values silently dropped across many records). Confirmed
+                # real motivating case (November dump, USER 13/2.jpeg
+                # record 94370045): a lowercase "us" between ZIP-shaped
+                # "21149" and house number "52" was claimed as Country_1/
+                # consumed, which then made Res Address's own contiguous-
+                # run walk see a sudden wide gap spanning the now-invisible
+                # consumed word and silently cut the address down to just
+                # "21149".
+                if not w.text.isupper():
+                    prev_digit = bool(earlier) and earlier[-1].text.isdigit() and w.x - earlier[-1].right <= max(w.height, earlier[-1].height) * 4
+                    next_digit = bool(later) and later[0].text.isdigit() and later[0].x - w.right <= max(w.height, later[0].height) * 4
+                    if prev_digit and next_digit:
+                        continue
                 filtered_countries.append((w, v, s))
             countries = filtered_countries
         if countries:
@@ -673,6 +855,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 if mw:
                     city1_start_key = min((w.line_num, w.x) for w in mw)
         city2_start_key: tuple[int, int] | None = None
+        city2_mw: list[OCRWord] = []
         if state_2_word is not None:
             city2 = self._extract_city(words, consumed, state_2_word)
             if not city2:
@@ -689,6 +872,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             if city2:
                 mw, value = city2
                 claim("city_2", mw, value, value)
+                city2_mw = mw
                 if mw:
                     city2_start_key = min((w.line_num, w.x) for w in mw)
 
@@ -903,6 +1087,32 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         if drug_match:
             w, value, sugg = drug_match
             claim("medicine", [w], value, value, note=suggestion_note(sugg))
+            # Card Name has no vocabulary match above when the form prints
+            # an explicit "N.A" in that slot instead of a real card type
+            # (verified real: USER 13/2.jpeg record 94370048, row
+            # "...FEMALE N.A XANAX N.A" - Sex_2, Card Name, Medicine,
+            # Dosage in schema order) - same "explicit N.A, no vocabulary
+            # shape of its own" situation already handled for Blood Group
+            # via its own na_before anchor, applied here with Medicine's
+            # own just-found, reliably-anchored position as the right
+            # boundary instead (Card Name directly precedes Medicine in
+            # schema order). Only claimed when nothing already filled
+            # card_name (a real card-type match always wins) and the N.A
+            # sits on the SAME line, immediately before Medicine, with a
+            # tight gap - the same adjacency requirement used throughout
+            # this file to avoid grabbing an unrelated earlier N.A.
+            if "card_name" not in candidates:
+                same_line = sorted(
+                    (o for o in words if id(o) not in consumed and o.line_num == w.line_num and o.x < w.x),
+                    key=lambda o: o.x,
+                )
+                if same_line:
+                    na_word = same_line[-1]
+                    gap = w.x - na_word.right
+                    if gap <= max(w.height, na_word.height) * 4 and closest_enum_match(
+                        na_word.text, pat.EXPLICIT_NA_VALUES, cutoff=0.8
+                    ):
+                        claim("card_name", [na_word], na_word.text, na_word.text)
 
         # --- dosage (strict, then fuzzy fallback for O/0/@ confusion) ---
         dosage_pos: int | None = None
@@ -1011,6 +1221,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             city2_start_key,
             stm_code_start_key,
             policy_no_start_key,
+            city2_mw,
         )
 
         for field_name in OCR_FIELD_ORDER:
@@ -1157,8 +1368,22 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             # Not layout-specific - confirmed the same N.A-as-zip pattern
             # in old-layout data too.
             na_ok = bool(later) and later[0].text.upper() in ("N.A", "N/A")
-            if not later or (
-                (na_ok or _looks_like_zip(later[0].text))
+            # "Last word on its line" is only weak evidence on its own - a
+            # street-suffix word that collides with a real state code (here
+            # "CT"/Court vs Connecticut, the same kind of 2-letter
+            # coincidence already confirmed for "CO"/Colorado above) is
+            # just as often simply the last word of a WRAPPED address line
+            # that ends before reaching the real City/State/Zip block on
+            # the next line, not a genuine trailing state. Confirmed real
+            # (November dump, USER 13/1.jpeg record 94370035): "...APT
+            # L-104 Ct" ends the address line with nothing after it, and
+            # the real state ("PA") sits on the FOLLOWING line - without
+            # this, "Ct" was kept as State_1, bumping the real State_1 into
+            # State_2 and losing the real State_2 entirely.
+            is_suffix_word = w.text.upper() in (pat.STREET_SUFFIX_WORDS | pat.STREET_SUFFIX_WORDS_OCR_VARIANTS)
+            if (not later and not is_suffix_word) or (
+                later
+                and (na_ok or _looks_like_zip(later[0].text))
                 and later[0].x - w.right <= max(w.height, later[0].height) * 4
             ):
                 kept.append((w, value, suggestion))
@@ -1471,6 +1696,56 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # found City_2 stops Shipper Name from overrunning into it). The
         # suffix-stop walk below still protects against over-extending
         # into Res Address/Shipper Name either way.
+        #
+        # A candidate word immediately followed (tight gap, no real word
+        # space) by a recognized street-suffix word is the TAIL of a
+        # street name ("Francisca St."), not a city, even though the
+        # suffix word itself never enters `same_line` below (a period-
+        # bearing suffix like "ST." fails the alphabetic-only check, and
+        # even a periodless one like "AVi" would still just look like an
+        # ordinary all-caps word in isolation). Without this, an all-caps
+        # street-name word sitting directly before the real, genuinely
+        # Title-Case city on the SAME line wins the strict ALL-CAPS tier
+        # outright, and the correct looser tiers never get a chance to run
+        # at all (city1 is already truthy). Confirmed real (November dump,
+        # USER 09/2582.jpeg record 421142): "...3 FRANCISCA ST. Hornbrook
+        # NC" - "FRANCISCA" (all caps) was picked as City_1 instead of the
+        # real "Hornbrook" (Title Case), which also truncated Res Address
+        # (bounded by City_1's position) to "P.o.box 59 3", dropping its
+        # own real tail "FRANCISCA ST.". Gap/suffix-set reuse matches the
+        # contiguous walk's own street-suffix stop further below exactly -
+        # same evidence, applied one step earlier.
+        suffix_vocab = pat.STREET_SUFFIX_WORDS | pat.STREET_SUFFIX_WORDS_OCR_VARIANTS
+        line_words = sorted(
+            (
+                w
+                for w in words
+                if id(w) not in consumed
+                and w.page == state_word.page
+                and w.line_num == state_word.line_num + line_offset
+            ),
+            key=lambda w: w.x,
+        )
+        # Walk backward from EVERY street-suffix word through its tightly-
+        # adjacent predecessors (not just the one immediately before it) -
+        # a street name can be more than one word ("FRANCISCA" here is
+        # itself later split into "FRANCIS"+"CA" by the earlier glued-
+        # state-suffix step, since "CA" is a valid state code; both halves
+        # are equally part of the same street-name phrase and must both be
+        # excluded, not just whichever one happens to sit directly next to
+        # the suffix word).
+        street_tail_ids: set[int] = set()
+        for i, w in enumerate(line_words):
+            if w.text.upper().rstrip(".") not in suffix_vocab:
+                continue
+            j = i - 1
+            while j >= 0:
+                gap = line_words[j + 1].x - line_words[j].right
+                if gap > max(line_words[j].height, line_words[j + 1].height) * 0.8:
+                    break
+                street_tail_ids.add(id(line_words[j]))
+                j -= 1
+
         same_line = [
             w
             for w in words
@@ -1481,6 +1756,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             and cls._looks_alphabetic_city_word(w.text)
             and (w.text.isupper() if require_upper else True)
             and not cls._is_city_noise_word(w.text)
+            and id(w) not in street_tail_ids
         ]
         if not same_line:
             return None
@@ -1641,7 +1917,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             # wrong field name instead of just losing one.
             stripped = w.text.replace(".", "").strip("'\"`\\")
             match = closest_enum_match(stripped, pat.YES_NO_NA_VALUES, cutoff=0.85)
-            if not match and stripped.upper() == "NOT":
+            if not match and stripped.upper() in ("NOT", "NOO"):
                 # A confirmed real, recurring OCR misread of "NO" (62
                 # occurrences across 19 of 44 real November-dataset
                 # images) - a trailing "T" is just different enough that
@@ -1653,6 +1929,20 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 # mode as the period/glued-suffix cases - this is a
                 # third, independent instance of the identical bug
                 # class, not a new mechanism.
+                #
+                # "NOO" (period-stripped "N.OO") is a fourth, same-class
+                # instance - a doubled trailing "O", the same character-
+                # doubling artifact already confirmed elsewhere in this
+                # November-dump family (e.g. shipping_cost's "$2.o0.00").
+                # Ratio against "NO" is exactly 0.80, the identical
+                # near-miss margin as "NOT" above. Confirmed real (USER
+                # 13/4.jpeg record 94370059): ground truth's own Smoker
+                # value is "N.OO" verbatim (the raw OCR noise, preserved
+                # rather than cleaned up) - breaking the run here cost
+                # BOTH the preceding Alcoholic answer (reduced to a
+                # length-1 run, discarded once a longer run formed later)
+                # and silently shifted Past Surg/Diabetic/Allergies each
+                # one field early.
                 match = "NO"
             if not match:
                 # A flag answer is sometimes glued with no space onto the
@@ -1895,6 +2185,34 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 candidates[field_name] = FieldCandidate(
                     field_name, shared_value, shared_value, conf, bbox, True
                 )
+            # The 93.2% statistic above is about records where D_Birth,
+            # DOB AND D_B_Life_Assure all three match - it says nothing
+            # about what to do with a genuinely distinct date found
+            # ALONGSIDE a repeated pair, and the loop above was silently
+            # overwriting that distinct date's own slot with the shared
+            # one regardless. Real, confirmed bug (November dump, USER 13/
+            # 1.jpeg record 94370030): three dates are actually printed -
+            # "07/28/1945" (D_Birth's row), "Wednesday, 08/13/2010"
+            # (D_B_Life_Assure's row, between the other two in reading
+            # order), "07/28/1945" again (DOB's row) - ground truth
+            # confirms D_B_Life_Assure genuinely is "Wednesday,
+            # 08/13/2010", not a third copy of the birth date, but the
+            # loop above assigned the shared "07/28/1945" to all three
+            # slots, discarding the real D_B_Life_Assure entirely. Only
+            # acts when there's exactly ONE date outside the repeated
+            # pair (an unambiguous "two match, one genuinely differs"
+            # shape) - any messier split (2+ found outside, or the group
+            # itself not a clean pair) is left to the existing behavior
+            # rather than guess which slot the extra date(s) belong to.
+            outside = [i for i in range(len(found)) if i not in group]
+            if len(outside) == 1 and len(group) == 2:
+                _, mw2, raw2 = found[outside[0]]
+                for w in mw2:
+                    if id(w) not in glued_recovery_word_ids:
+                        consumed.add(id(w))
+                candidates["d_b_life_assure"] = FieldCandidate(
+                    "d_b_life_assure", raw2, raw2, average_confidence(mw2), bounding_box_for_words(mw2), True
+                )
         else:
             # No repeat evidenced in this pass (0 or 1 date found, or
             # several genuinely distinct ones) - fall back to the prior
@@ -1989,11 +2307,39 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # If fewer than 4 are available, keep pill_rate first and
         # total_amount last (the two most reliably identifiable), leaving
         # the middle ones unmatched rather than mis-assigned.
+        #
+        # Real, confirmed bug (November dump, USER 13/1.jpeg record
+        # 94370029): the OLD formula `range(4 - len(tail), 4)` does NOT
+        # implement that stated intent for any count between 1 and 4 - for
+        # 3 found it produces positions [1,2,3], which drops PILL RATE
+        # (position 0) and shifts the other three down by one, not
+        # "pill_rate first". Confirmed from this record's own raw OCR text
+        # ("$2.86 $505.00 $#20.00 $525.00" - Shipping Cost's own "$#20.00"
+        # fails the currency regex outright because of its embedded "#",
+        # so only 3 of the 4 are ever found): the old formula assigned
+        # pill_rate's real value "$2.86" to Cost, Cost's real value
+        # "$505.00" to Shipping Cost, and left Pill Rate None entirely -
+        # three fields wrong/missing from one single garbled character.
         tail = tail[:4]
-        if len(tail) < 4:
-            positions = list(range(4 - len(tail), 4)) if len(tail) > 1 else [3]
-        else:
+        if len(tail) == 4:
             positions = list(range(4))
+        elif len(tail) == 3:
+            # The only real ambiguity left is which of the two MIDDLE
+            # slots (Cost, Shipping Cost) is the missing one - use the
+            # actual gap between the 3 found positions (same gap-based
+            # boundary reasoning already used throughout this file) rather
+            # than assuming it's always the same slot: the gap spanning a
+            # skipped slot runs noticeably wider than an ordinary adjacent
+            # gap between two genuinely consecutive currency values.
+            gap_before = tail[1][0] - tail[0][0]
+            gap_after = tail[2][0] - tail[1][0]
+            positions = [0, 2, 3] if gap_before > gap_after * 1.4 else [0, 1, 3]
+        elif len(tail) == 2:
+            positions = [0, 3]
+        elif len(tail) == 1:
+            positions = [3]
+        else:
+            positions = []
         for pos, item in zip(positions, tail):
             make(tail_fields[pos], item)
 
@@ -2019,7 +2365,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             pool.sort(key=lambda w: abs(w.y - ref_y))
         return pool[0], pool[0].text
 
-    _TRAILING_GLUED_SUFFIX = re.compile(r"[.,=_-]{1,3}\d{2,6}")
+    _TRAILING_GLUED_SUFFIX = re.compile(r"[.,=_#@-]{1,3}\d{2,6}")
     # Cross-word bridge: a genuinely separate OCR word that is PURELY
     # separator characters (no letters, no digits - e.g. "=-", "--", ",--")
     # directly between the code and a trailing pure-digit word (e.g.
@@ -2050,7 +2396,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
     # independently accepts either separator - the same "either is fine,
     # as long as it's immediately next in reading order" tolerance
     # already established for the 5-flag run's own cross-line wrap.
-    _CROSS_WORD_BRIDGE = re.compile(r"[.,=_-]{0,2}[ \n][.,=_-]{1,3}[ \n]\d{2,6}\b")
+    _CROSS_WORD_BRIDGE = re.compile(r"[.,=_#@-]{0,2}[ \n][.,=_#@-]{1,3}[ \n]\d{2,6}\b")
 
     # Unlike the ambiguous per-instance O/0 and I/l confusables elsewhere in
     # this code family (where the SAME rendered character is genuinely a
@@ -2067,6 +2413,25 @@ class RuleBasedExtractionEngine(ExtractionEngine):
     _KNOWN_CODE_TEMPLATE_FIXES = (
         (re.compile(r"(Y+t_)17(-Un)"), r"\g<1>i7\g<2>"),
     )
+    # Tried: a third template fix for "O(l*)a" immediately before "C"/"c"
+    # in this same code family, on the theory that it was always really
+    # "0" + "1"*n (Azure misreading 0->O, 1->l), the same confirmed pattern
+    # as the Yt_i7 fix above - measured a real net gain on the November
+    # dump (stm_code 34.0%->51.6% on a 53-image sample, e.g. USER 06/
+    # 1758.jpeg record 412942's real "BaX_01aCo-6577"). Reverted anyway:
+    # direct ground-truth comparison (USER 07/2170.jpeg, records 417038/
+    # 417039/417042/417043/417046/417047 - 6 separate records, zero
+    # exceptions among them) shows the SAME "_Ol[l]aC"/"_OlacM" shape,
+    # including the identical "BaX_" prefix used by USER 06's own
+    # digit-convention records, genuinely means to stay LETTERS there
+    # ("Ba.X_OlaCp_7845", "BaX_OlaCp_8747" - confirmed directly against
+    # the source XML, not a script bug). So this character is genuinely
+    # ambiguous per-batch with no reliable signal in the record itself to
+    # tell which convention applies - unlike Yt_i7, which has zero known
+    # counter-examples across the whole corpus - and "fix" it blindly is
+    # indistinguishable from guessing, which the no-guessing rule forbids
+    # even when it nets positive on one particular sample.
+
 
     @classmethod
     def _normalize_known_code_confusables(cls, value: str) -> str:
@@ -2116,7 +2481,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             # by the digit check above, and ordinary names don't naturally
             # contain underscores/hyphens/commas mid-word the way these
             # codes do, so no density check is needed there.
-            if not any(ch in ".,_-" for ch in m.group(0)):
+            if not any(ch in ".,_#@-" for ch in m.group(0)):
                 digit_count = sum(ch.isdigit() for ch in m.group(0))
                 if digit_count / len(m.group(0)) < 0.3:
                     continue
@@ -2185,10 +2550,23 @@ class RuleBasedExtractionEngine(ExtractionEngine):
             # whitespace, never a comma that belongs to earlier text.
             if start > 0 and text[start - 1] == ",":
                 start -= 1
-            elif layout == "new" and start > 0 and text[start - 1] == " ":
-                # NEW-LAYOUT ONLY: this document family's dense wrapped-paragraph layout
-                # (USER01/USER12, unlike the glued-code layout above)
-                # sometimes reads a short leading fragment of the code as
+            elif start > 0 and text[start - 1] == " ":
+                # Originally restricted to new-layout only (that document
+                # family's dense wrapped-paragraph layout, USER01/USER12) -
+                # widened to both layouts after direct ground-truth
+                # comparison (November dump, USER 06/1758.jpeg record
+                # 412949) found the identical pattern in old-layout data:
+                # "B," + "aaX_01aCm-6849" as two separate OCR words with a
+                # real 3px space between them (ground truth
+                # "B,aaX_01aCm-6849"), the exact same leading-fragment shape
+                # already confirmed on the other document family. Same
+                # mirror-image widening already applied to the TRAILING
+                # bridge case below for the identical reason - this
+                # fragmentation is an OCR-tokenization artifact of the hash
+                # code shape itself, not something tied to one document
+                # family's structural layout.
+                #
+                # Sometimes reads a short leading fragment of the code as
                 # its OWN OCR word, with a real space before the rest -
                 # verified directly against 6+ real records, e.g. "Ba,
                 # XX_OlaCp_21741" (ground truth "Ba,XX_01aCp_21741") and
@@ -2289,8 +2667,12 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 # the same way, generalized to every separator character this
                 # code family actually uses (",", "-", "_", ".", "=").
                 value = re.sub(r"\s*([,\-_.=])\s*", r"\1", value)
-                if layout == "new":
-                    value = RuleBasedExtractionEngine._normalize_known_code_confusables(value)
+                # Not layout-gated: per this fix's own docstring, the
+                # template it corrects is confirmed fixed regardless of
+                # which document family printed it - restricting it to
+                # new-layout only was never a safety requirement, just an
+                # artifact of where it was first found.
+                value = RuleBasedExtractionEngine._normalize_known_code_confusables(value)
                 if has_base_digit or any(ch.isdigit() for ch in value):
                     found.append((m.start(), mw, value))
 
@@ -2533,7 +2915,32 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         run = [candidates[0]]
         for w in candidates[1:]:
             if w.line_num != run[-1].line_num:
-                break
+                # A genuine field value can wrap onto the next physical
+                # line entirely, not just stretch close to a same-line gap
+                # - allowed only when `w` is the LEFTMOST word on its own
+                # line (genuinely first in reading order there, not a
+                # stray mid-line word this window happened to reach),
+                # mirroring the same leftmost-of-line safeguard already
+                # used for the 5-flag run's own cross-line continuation
+                # elsewhere in this file. This is safe specifically here
+                # (unlike a field with no independent right-hand anchor)
+                # because `end_key` is itself another field's own
+                # independently-found position - candidates are already
+                # filtered to strictly before it, so crossing a line can
+                # never reach past the real boundary. Confirmed real
+                # (November dump, USER 13/1.jpeg record 94370029): Res
+                # Address's real text wraps as "2320 Bithany Rd Avi"
+                # (row 1) + "Walgrovi" (row 2, leftmost word on that row,
+                # with City_1 - this call's end_key - starting right after
+                # it on the SAME row), ground truth "2320 Bithany Rd Avi
+                # Walgrovi".
+                is_leftmost = not any(
+                    o.page == w.page and o.line_num == w.line_num and o.x < w.x for o in words
+                )
+                if not is_leftmost:
+                    break
+                run.append(w)
+                continue
             gap = w.x - run[-1].right
             # Widened from 0.8x to 1.0x, HERE ONLY (not the other 5 sites
             # in this file using the same 0.8x threshold - tried widening
@@ -2742,7 +3149,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
 
     @staticmethod
     def _trailing_contiguous_run(
-        candidates: list[OCRWord], max_count: int = 4
+        candidates: list[OCRWord], max_count: int = 4, allow_line_wrap: bool = False
     ) -> list[OCRWord]:
         """Among words already filtered to "name-shaped", keep only the
         trailing contiguous phrase closest to the right-hand anchor, instead
@@ -2772,13 +3179,36 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         # other fields, per this function's own docstring), and the
         # leftmost-word-on-next-line condition is satisfied far more
         # often there by unrelated leading words ("joan.", "wan",
-        # "unitLani", address fragments) than by genuine wraps. Reverted;
-        # this shared helper's strict same-line boundary stays as the
-        # safer default for all three callers (Shipper Name, STM Name,
-        # City_2) rather than trading a worse field for a better one.
+        # "unitLani", address fragments) than by genuine wraps. Reverted at
+        # the time to an unconditional same-line boundary for all three
+        # callers (Shipper Name, STM Name, City_2) rather than trading a
+        # worse field for a better one.
+        #
+        # Re-added since, but opt-in per caller (allow_line_wrap, default
+        # False) instead of shared behavior - STM Name specifically asked
+        # for it again (confirmed real, November dump USER 06/1758.jpeg
+        # records 412944/412945: "Lianlieb Tattyf" and "Jsobell
+        # Scott.Shipman" each wrap mid-name onto the next physical line,
+        # STM Name silently blank both times), and Shipper Name's own
+        # extraction has since changed enough (the city_2-reclaim fallback
+        # below, the dup_name_tokens filter) that re-measuring found no
+        # reason to believe the original regression would still reproduce
+        # there - but Shipper Name and City_2 are left at the proven-safe
+        # default rather than assuming that without new evidence of their
+        # own.
+        leftmost_ids: set[int] = set()
+        if allow_line_wrap:
+            by_line: dict[int, list[OCRWord]] = {}
+            for w in ordered:
+                by_line.setdefault(w.line_num, []).append(w)
+            for line_words in by_line.values():
+                leftmost_ids.add(id(min(line_words, key=lambda w: w.x)))
         run = [ordered[-1]]
         for w in reversed(ordered[:-1]):
             if w.line_num != run[0].line_num:
+                if allow_line_wrap and id(w) in leftmost_ids:
+                    run.insert(0, w)
+                    continue
                 break
             gap = run[0].x - w.right
             # Widened from 0.8x to 1.0x, then to 1.25x - same real,
@@ -2810,6 +3240,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
         city2_start_key=None,
         stm_code_start_key=None,
         policy_no_start_key=None,
+        city2_mw=None,
     ) -> None:
         """Per BN_Workflow.pdf: Billing Name must match Customer Name (rule
         16), and Name_P_Holder is explicitly "Same as Customer Name" (rule
@@ -3030,6 +3461,35 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                     city2_value = _smart_join(city2_run)
                     claim("city_2", city2_run, city2_value, city2_value)
 
+        # City_2's own extraction (above, much earlier in this method) has
+        # no concept of "stop, the rest belongs to Shipper Name" - when
+        # nothing above managed to locate Shipper Name at all, a MULTI-WORD
+        # City_2 match is itself the strongest available evidence that it
+        # absorbed Shipper Name's own text too (a real US city name sits in
+        # City_2 ALONE in the large majority of real records; Shipper Name,
+        # by contrast, is reliably 2+ words and has no shape signal of its
+        # own to find separately once City_2's greedy backward walk has
+        # already consumed every word up to State_2). Confirmed real
+        # (November dump, USER 06/1758.jpeg record 412948 and multiple
+        # USER 10/USER 13 records): City_2 absorbed "Lkgbvayalil Sbowman
+        # Ramsey" (3 words) with Shipper Name entirely missing; the real
+        # City_2 is just "Ramsey", the LAST word, with "Lkgbvayalil
+        # Sbowman" belonging to Shipper Name. Reassigns the leading words
+        # to Shipper Name and shrinks City_2 to its own last word, rather
+        # than leaving Shipper Name silently blank. Deliberately checked
+        # LAST (after every other recovery above has had its chance) and
+        # gated on Shipper Name still being completely unclaimed - this
+        # only fires when nothing else found a better explanation.
+        if candidates.get("shipper_name") is None and city2_mw and len(city2_mw) > 1:
+            reclaimed = sorted(city2_mw, key=lambda w: (w.line_num, w.x))
+            new_shipper = reclaimed[:-1]
+            new_city2 = [reclaimed[-1]]
+            if len(new_shipper) >= 2:
+                shipper_value = _smart_join(new_shipper)
+                claim("shipper_name", new_shipper, shipper_value, shipper_value)
+                city2_value = new_city2[0].text
+                claim("city_2", new_city2, city2_value, city2_value)
+
         if stm_code_start_key is not None:
             candidates_stm = [
                 w
@@ -3075,7 +3535,7 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 and w.text.upper() != "CARD"
                 and w.text.upper() not in pat.CARD_TYPES
             ]
-            stm_tokens = self._trailing_contiguous_run(candidates_stm)
+            stm_tokens = self._trailing_contiguous_run(candidates_stm, allow_line_wrap=True)
             # NEW-LAYOUT ONLY: same wrapped-line recovery as the
             # shipper-name case above, for the same reason (verified
             # directly, e.g. record 402428: "Kscabell" ends one line,

@@ -102,7 +102,23 @@ def _find_anchor_words(words: list[OCRWord]) -> list[tuple[str, OCRWord]]:
     for w in words:
         text = w.text.strip()
         m = pat.RECORD_ID_ANCHOR.search(text)
-        if m:
+        # Real, confirmed bug (November dataset, USER 7 69N/1649.jpeg
+        # record 29622519): the repeated, synthetic username-style name
+        # "milo1123" (printed 3x per this record's own duplicate-name
+        # rule) was misread as "miloll23" on its third occurrence - l/1
+        # and O/0 are already in RECORD_ID_ANCHOR's own confusable
+        # class, and that misread happens to satisfy the anchor shape.
+        # Unlike the numeric/prefixed-numeric branches below, this
+        # branch had no "leftmost word on its line" requirement at all,
+        # even though Record No is schema-guaranteed to lead its own
+        # line exactly like those other two shapes - the false match sat
+        # mid-line (a name field's 3rd repeat), far from the left
+        # margin, and was accepted anyway, splitting one real record
+        # into a corrupted pair (the false anchor's own record_no came
+        # back blank, and its neighbor absorbed/lost fields across the
+        # bogus boundary). Same safeguard, same reason, now applied here
+        # too - a genuine anchor is never the exception to this rule.
+        if m and id(w) in leftmost_ids:
             found.append((m.group(0).upper(), w))
             continue
         if has_alnum_anchor:

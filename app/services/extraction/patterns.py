@@ -101,7 +101,22 @@ RECORD_ID_NUMERIC = re.compile(r"\A\d{5,8}\Z")
 # document family) measured zero false positives from adding it.
 RECORD_ID_PREFIXED_NUMERIC = re.compile(r"\A[S5\$][8B6]\d{6}\Z")
 
-EMAIL = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
+# "@" is sometimes genuinely printed/read as a plain hyphen in this
+# document family's synthetic email addresses, not just OCR noise on top
+# of a real "@" - confirmed across the FULL November-dump ground-truth
+# corpus (34 of 2176 records, 1.6%, spanning multiple users), e.g.
+# "doda_burim-hotmail.com", "aakd2-hotmail.com", "greta-n4s-cs.net" - a
+# consistent, recurring convention, not a one-off. Verified directly
+# against the source image for one case (USER 10/2994.jpeg): the raw OCR
+# word is "mumu75-hotmail.com", a plain hyphen, cleanly read either way.
+# "-" is listed as an alternate separator (not folded into the username
+# class alongside "@") specifically so the regex engine treats it as the
+# single split point the same way "@" already is - a real email's own
+# username may itself contain a hyphen (e.g. "john-doe@gmail.com"), and
+# this alternation still finds the right split there since "@" and "-"
+# are mutually exclusive per match: whichever symbol is actually in the
+# word is the one used as the separator, not scanned for a specific one.
+EMAIL = re.compile(r"\b[A-Za-z0-9._%+\-]+[@-][A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
 
 # Two phone grammars appear across document families: "(919) - 877-8368"
 # (punctuated) and a bare 10-digit run with no separators at all
@@ -111,10 +126,17 @@ EMAIL = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
 # that dash as "=", "~", "_" or similar on this document family, and a
 # strict literal would refuse to match through it.
 PHONE_PUNCTUATED = re.compile(r"\(?\d{3}\)?[\s\-=~_.]*\d{3}\s*-\s*\d{4}")
-# Optional leading "1" (US country code) before the 10-digit number, e.g.
-# "13741116994" - without this, an 11-digit run matches nowhere at all
-# under a strict \b\d{10}\b (there's no internal word boundary to anchor on).
-PHONE_BARE = re.compile(r"\b1?(\d{10})\b")
+# Originally "optional leading 1 (US country code) + 10 digits" only, to
+# catch an 11-digit run like "13741116994" that a strict \b\d{10}\b can't
+# anchor on (no internal word boundary). Widened to any 11-digit run, not
+# just one with a leading "1": confirmed real (November dump, USER 13 -
+# 6+ separate records, zero counter-examples) that this document family's
+# own PhNo_1/PhNo_2 values are routinely bare 11-digit numbers that do NOT
+# start with "1" (e.g. "91477396740", "47854352274") - a straight country-
+# format variation, not noise. The old pattern silently left every one of
+# these phone numbers unmatched even though the OCR read them perfectly
+# cleanly (verified directly against the source image for "91477396740").
+PHONE_BARE = re.compile(r"\b\d{10,11}\b")
 
 # Verified against real ground-truth data: this document family's zip codes
 # are sometimes stored/printed with a leading zero dropped (e.g. a real
@@ -281,7 +303,15 @@ DRUG_NAMES = {
     "LORAZEPAM", "CLONAZAPAM", "CLONAZEPAM", "DIDREX",
 }
 
-COUNTRY_VALUES = {"US", "USA"}
+# "AMERICA"/"AMERICAN" are both genuinely printed Country values in this
+# schema, not OCR noise on top of "US" - confirmed across the full 17-user
+# November-dump ground-truth corpus (60 real occurrences combined: 26+16 for
+# "AMERICAN", 6+12 for "AMERICA", across Country_1/Country_2), not a one-off.
+# Previously only {"US", "USA"} were recognized, so every one of those 60
+# records' Country_1/Country_2 silently came back empty - confirmed real,
+# USER 13/1.jpeg record 94370029 (Country_1/Country_2 both "AMERICA" in the
+# ground truth).
+COUNTRY_VALUES = {"US", "USA", "AMERICA", "AMERICAN"}
 
 # Content-based disambiguation for RECORD_ID_NUMERIC's non-6-digit shapes
 # (5, 7, 8 digits) - shared by record_splitter.py (record-boundary
