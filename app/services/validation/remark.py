@@ -3,13 +3,22 @@
 otherwise Remark names the invalid field(s) ("X is invalid" / "X and Y are
 invalid" / "X, Y, and Z are invalid").
 
-A field counts as invalid here when either:
+A field counts as invalid here when any of:
   - its value is an explicit N.A marker in the source ("N.A", "NA", ...) -
     the spec's "Common Rule (N.A Handling)" treats a confirmed-blank source
     field as invalid and requires it to be called out in Remark, or
   - it has a value but that value failed its own format validation
     (ExtractedField.validation.format_valid is False - see
-    services/validation/field_validation.py for the per-field rules).
+    services/validation/field_validation.py for the per-field rules), or
+  - the operator explicitly flagged it via ExtractedField.marked_invalid -
+    independent of the first two: a field can hold a perfectly
+    well-formatted, non-N.A value (e.g. a real-looking but WRONG email,
+    "pranay123@gmial.com") that only a human reviewer can recognize as
+    wrong. This flag is how that gets into Remark without destroying the
+    value itself - see api/documents.py's update_fields, which is the only
+    place that sets it, and ExtractedField's own docstring for the bug this
+    replaced (the old UI wrote the literal text "N.A" over the value to
+    piggyback on the first rule above, permanently losing it).
 
 Deliberately NOT included: fields with no value at all because OCR/
 extraction simply failed to find anything. The spec's "blank/space in the
@@ -42,9 +51,16 @@ def generate_remark(fields: dict[str, ExtractedField]) -> str:
         field = fields.get(name)
         if field is None:
             continue
-        if _is_explicit_na(field.value):
-            invalid_labels.append(field.label)
-        elif field.value and field.validation.format_valid is False:
+        # Each of the three conditions is independently sufficient - `or`,
+        # not `elif`, so a field already caught by one (e.g. a genuine N.A
+        # value) still only ever adds its label once, but an operator
+        # marking a WELL-FORMATTED value invalid isn't silently skipped
+        # just because neither of the other two happened to fire.
+        if (
+            _is_explicit_na(field.value)
+            or (field.value and field.validation.format_valid is False)
+            or field.marked_invalid
+        ):
             invalid_labels.append(field.label)
 
     if not invalid_labels:

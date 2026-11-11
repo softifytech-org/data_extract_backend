@@ -107,6 +107,19 @@ class ExtractedField(BaseModel):
     source: FieldSource = FieldSource.OCR
     validation: FieldValidation = Field(default_factory=FieldValidation)
     bounding_box: BoundingBox | None = None
+    # Operator-set "this value is wrong" flag, independent of `value` itself
+    # (real, confirmed bug: the review UI used to express this by
+    # overwriting `value` with the literal text "N.A", destroying whatever
+    # the operator had typed/OCR had read - "pranay123@gmial.com" became
+    # unrecoverable the moment it was flagged, even though the operator
+    # only wanted to flag it, not blank it). Kept as its own property so
+    # marking a field invalid NEVER touches `value` - see
+    # services/validation/remark.py's generate_remark, which now treats
+    # this exactly like the two existing ways a field counts as invalid
+    # (explicit N.A value, failed format validation), and api/documents.py's
+    # update_fields, which updates this independently of any value edit in
+    # the same request.
+    marked_invalid: bool = False
     # Optional GPT Vision cross-check (services/ai_vision.py) - populated
     # only when a human explicitly triggers AI verification for this record.
     # Read-only comparison data: never overwrites `value`.

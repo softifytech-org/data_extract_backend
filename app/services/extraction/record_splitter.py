@@ -122,6 +122,24 @@ def _find_anchor_words(words: list[OCRWord]) -> list[tuple[str, OCRWord]]:
             found.append((m.group(0).upper(), w))
             continue
         if has_alnum_anchor:
+            # Tried recovering a record whose 2-letter prefix was dropped
+            # entirely, not just misread (e.g. "MI296T21221" ->
+            # "96T21221", November dataset, USER 7 69N/1555.jpeg) via a
+            # bare DDD-L-DD shape, gated on the same leftmost + name +
+            # email companion evidence the plain-numeric family below
+            # uses. Measured net NEGATIVE on this document family's dense
+            # wrapped rows (tune-set -988 matches, concentrated entirely
+            # in the 69N users, e.g. USER 8 69N 79.5%->70.0%): this
+            # family's own STM_Code/Policy_No hash-coded values routinely
+            # contain this exact digit-letter-digit shape themselves, and
+            # when one lands leftmost on a wrapped continuation line with
+            # a name-shaped word and an email reference nearby (both
+            # common on this dense layout), it was wrongly accepted as a
+            # brand-new record anchor, splitting one real record into a
+            # corrupted pair. Reverted - the one real case this targeted
+            # stays an accepted, documented gap rather than risk this
+            # family's own, much larger accuracy, per "never keep a fix
+            # that helps one place but damages another."
             continue
         if id(w) in leftmost_ids and pat.RECORD_ID_PREFIXED_NUMERIC.fullmatch(text):
             found.append((text.upper(), w))

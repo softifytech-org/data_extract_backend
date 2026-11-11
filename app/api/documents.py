@@ -351,14 +351,27 @@ def update_fields(
     for name, item in body.fields.items():
         existing = entry.fields.get(name)
         spec = FIELD_SPEC_BY_NAME[name]
-        new_value = item.value.strip() if item.value else None
         if existing is None:
             existing = ExtractedField(field_name=name, label=spec.label, data_type=spec.data_type)
             entry.fields[name] = existing
-        existing.value = new_value
-        existing.source = FieldSource.HUMAN
-        existing.status = FieldStatus.CORRECTED if new_value else FieldStatus.NEEDS_REVIEW
-        existing.confidence = 100.0 if new_value else 0.0
+        # `value` and `marked_invalid` are independent properties, each only
+        # touched when the request actually included it - model_fields_set
+        # (not "is the value None/False") is what distinguishes "omitted,
+        # leave alone" from "explicitly set to this". Without this split, a
+        # request that only toggles the invalid flag would otherwise also
+        # silently blank the value (the exact bug this exists to fix:
+        # marking a field invalid must never erase it), and a request that
+        # only edits the value would silently clear the operator's own
+        # invalid flag they hadn't touched.
+        fields_set = item.model_fields_set
+        if "value" in fields_set:
+            new_value = item.value.strip() if item.value else None
+            existing.value = new_value
+            existing.source = FieldSource.HUMAN
+            existing.status = FieldStatus.CORRECTED if new_value else FieldStatus.NEEDS_REVIEW
+            existing.confidence = 100.0 if new_value else 0.0
+        if "marked_invalid" in fields_set and item.marked_invalid is not None:
+            existing.marked_invalid = item.marked_invalid
 
     _revalidate_entry(entry, settings)
     _recompute_document_status(record)

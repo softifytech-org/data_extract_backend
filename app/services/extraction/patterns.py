@@ -55,6 +55,17 @@ RECORD_ID_FUZZY = re.compile(
 RECORD_ID_ANCHOR = re.compile(
     rf"\b[A-Za-z]{{2}}[{_DIGIT_CONFUSABLE_CLASS}]{{3}}[A-Za-z][{_DIGIT_CONFUSABLE_CLASS}]{{2,5}}"
 )
+# Tried a further-loosened variant of this shape with no leading-letter
+# requirement at all, to recover a record whose 2-letter prefix was
+# dropped outright rather than misread (e.g. "MI296T21221" read as
+# "96T21221", November dump, USER 7 69N/1555.jpeg) - reverted (see
+# record_splitter.py's _find_anchor_words) after it measured a severe
+# regression on this document family's own dense wrapped rows (tune-set
+# -988 matches, concentrated entirely in the 69N users): a bare
+# digit-letter-digit shape that short is exactly what this family's own
+# STM_Code/Policy_No hash codes routinely contain, so it kept firing on
+# those instead of a genuine dropped-prefix anchor. Left as a known,
+# accepted gap rather than reintroduced.
 
 # A second, distinct document family in this schema prints Record No as a
 # plain digit number with no letter prefix at all (e.g. "241001"), matching
@@ -155,6 +166,20 @@ CURRENCY = re.compile(
     rf"(?:\.[{_DIGIT_CONFUSABLE_CLASS}]{{1,3}})?"
 )
 
+# Same decimal shape as CURRENCY but with NO leading "$" required - this
+# document family genuinely prints Total Amount without the "$" some of
+# the time (verified against real ground-truth data, not an OCR miss:
+# November dump, USER 06/1751.jpeg record 412880, GT Total_Amount is
+# literally "175.00", no dollar sign, exactly matching the raw printed
+# text). Used ONLY as a narrow, position-anchored recovery in
+# _extract_currency_fields (immediately after the last found "$" amount,
+# never a page-wide scan) - a bare decimal anywhere else on the page is
+# nowhere near distinctive enough to safely claim as a currency field.
+BARE_DECIMAL_CURRENCY = re.compile(
+    rf"[{_DIGIT_CONFUSABLE_CLASS}]{{1,3}}(?:,[{_DIGIT_CONFUSABLE_CLASS}]{{3}})*"
+    rf"\.[{_DIGIT_CONFUSABLE_CLASS}]{{1,3}}"
+)
+
 # Optional decimal portion (37.5 MG, 0.25 MG are common real doses) -
 # without it, "\b\d{1,4}\s?MG\b" skips straight past the "37." prefix (a
 # literal "." isn't \s and isn't a digit) and matches just the "5 MG" tail,
@@ -239,6 +264,20 @@ STREET_SUFFIX_WORDS = {
     # picked as City_1 (an all-caps word on the same line) instead of
     # the real city "Indianapolis" one word later.
     "BOX",
+    # Same role again: a unit designator, not a street suffix, but it
+    # marks the same kind of "address still continues past here" boundary
+    # BOX already covers. Confirmed real, November dump, USER 06/
+    # 1751.jpeg record 412880: "...APT 1 Richmond" (Richmond wraps onto
+    # the line directly above State_1, a real "...DIAMOND CT APT 1
+    # Richmond\nCA 19630..." layout) - with "APT" unrecognized, it was
+    # itself picked as City_1 (an unclaimed word on that same wrapped
+    # line) instead of the real city "Richmond" two words later, which
+    # also left Res Address truncated one word short of "APT 1" (Res
+    # Address's own gap-walk is bounded by City_1's position, so City_1
+    # landing too early cut off its own field too, the same cascading
+    # failure already seen for "Ct"/Court vs the state code and the
+    # street-suffix-tail case in _extract_city).
+    "APT", "APARTMENT", "UNIT", "STE", "SUITE",
 }
 # This document consistently OCRs a printed "E" as "I" in these suffix
 # words specifically (confirmed against real ground truth: "Drivi"=Drive,
@@ -273,6 +312,17 @@ BLOOD_GROUP_VALUES = {"A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"}
 # anything. See services/validation/remark.py: only an EXPLICIT NA reading
 # contributes to the generated Remark field; a blank extraction does not.
 EXPLICIT_NA_VALUES = {"N.A", "N.A.", "NA", "N/A", "NONE"}
+
+# Same explicit-NA shape, but tolerant of a trailing-digit artifact glued
+# directly onto it with no space (e.g. "N.A15") - a genuine line-wrap/OCR
+# glue effect confirmed on real data (November dump, USER 06/1751.jpeg
+# record 412877: the state-row token right after State_2 "LA" reads
+# "N.A15", not a clean "N.A"), the same family of glued-trailing-digits
+# artifact already handled elsewhere for dates and HASH_CODE. Matched as
+# its own regex (not added to EXPLICIT_NA_VALUES, a plain set of exact
+# strings) so callers can still recover the real "N.A" meaning via a
+# regex match rather than an exact lookup.
+EXPLICIT_NA_WITH_GLUED_DIGITS = re.compile(r"^(?:N\.?A\.?|N/A)\d{0,4}$", re.IGNORECASE)
 
 CARD_TYPES = {
     "AMERICAN EXPRESS",
@@ -350,6 +400,27 @@ def looks_like_name_start(text: str) -> bool:
 # split in two" from "two different words" without widening the net.
 _EMAIL_SPLIT_MAX_GAP = 4
 
+# A third real email-garbling shape, distinct from the split-TLD case
+# above: the "@" itself misread as 1-2 ordinary letters with no symbol
+# left at all (e.g. "jvterdocbmr@ntxna.com" -> "jvterdocbmrentxna.com"),
+# so EMAIL's own required "@"/"-" separator is nowhere in the word and
+# no amount of adjacent-word rejoining helps (it's one single token, not
+# two split apart). Recognized instead by what survives intact: a long
+# run of email-local-part-shaped characters immediately followed by a
+# common TLD, with no space anywhere - confirmed real (November dump,
+# USER 13/79.jpeg record 94370811: this exact row's anchor was being
+# rejected and the whole record silently dropped, caught only because
+# the record was visibly present on the source page but missing from
+# the app's output). Deliberately NOT a change to the shared EMAIL
+# pattern itself (used for the actual Email Address field too, a
+# separate, already-tuned concern) - this is a narrower, record-anchor-
+# only signal, and only engages when the main EMAIL check already found
+# nothing on the line.
+_EMAIL_GARBLED_SEPARATOR = re.compile(
+    r"\A[A-Za-z0-9._%+]{6,}\.(?:com|net|org|edu|gov|co|us|info|biz|io)\Z",
+    re.IGNORECASE,
+)
+
 
 def line_has_email(line_words) -> bool:
     """A genuine record-start line carries a CustomerName/ShipperName AND
@@ -379,4 +450,4 @@ def line_has_email(line_words) -> bool:
         gap = b.x - (a.x + a.width)
         if gap <= _EMAIL_SPLIT_MAX_GAP and EMAIL.search(a.text + b.text):
             return True
-    return False
+    return any(_EMAIL_GARBLED_SEPARATOR.match(w.text) for w in line_words)

@@ -20,6 +20,15 @@ class ProcessResponse(BaseModel):
 
 class FieldUpdateItem(BaseModel):
     value: str | None = Field(default=None, max_length=500)
+    # Optional and independent of `value` - omit entirely to leave the
+    # field's current marked_invalid state untouched (e.g. a plain value
+    # edit), or include it explicitly to set/clear the invalid flag without
+    # touching `value` at all (the Mark Invalid toggle). Distinguishing
+    # "omitted" from "explicitly false" matters here (see
+    # api/documents.py's update_fields, which checks model_fields_set
+    # rather than this field's own value), so this has no default baked
+    # into request handling beyond "not provided."
+    marked_invalid: bool | None = Field(default=None)
 
 
 class FieldsUpdateRequest(BaseModel):
