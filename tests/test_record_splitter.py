@@ -300,3 +300,31 @@ def test_numeric_anchors_unaffected_by_a_single_alnum_false_positive():
     found = [t for t, _ in _find_anchor_words(words)]
     assert "241001" in found
     assert "241002" in found
+
+
+def test_numeric_anchors_unaffected_by_repeated_midline_alnum_false_positive():
+    """Real, confirmed bug (November dataset, USER 33/5820.jpeg - reported
+    as "the whole image fails to extract anything"): this image's own
+    record-ID shape is the plain 5-digit numeric family ("70181".."70190",
+    each genuinely leftmost on its line), but its billing contact email,
+    "bill@holtav.com", repeats across several records and its shape
+    coincidentally satisfies the confusable RECORD_ID_ANCHOR regex - always
+    mid-line (an email is never the first word of a record-start line), but
+    still 2+ raw matches, which used to be enough on its own to set
+    has_alnum_anchor and suppress the plain-numeric branch for the WHOLE
+    page - zero anchors, zero records. Counting only LEFTMOST alnum matches
+    (consistent with the genuine-acceptance rule just above, and with the
+    schema invariant that Record No always leads its own line) fixes this:
+    mid-line text can never be a genuine anchor anyway, so it must never
+    count as evidence that the page even has an alphanumeric-family anchor
+    to begin with."""
+    words = [
+        _word("70181", x=28, width=38, line_num=0, y=21),
+        _word("Wmeyer", x=75, width=60, line_num=0, y=21),
+        _word("bill@holtav.com", x=172, width=100, line_num=0, y=21),
+        _word("70182", x=28, width=38, line_num=1, y=120),
+        _word("Cmartine", x=76, width=70, line_num=1, y=120),
+        _word("bill@holtav.com", x=268, width=100, line_num=1, y=120),
+    ]
+    found = [t for t, _ in _find_anchor_words(words)]
+    assert found == ["70181", "70182"]

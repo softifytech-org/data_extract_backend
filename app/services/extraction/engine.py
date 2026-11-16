@@ -2208,6 +2208,17 @@ class RuleBasedExtractionEngine(ExtractionEngine):
                 # schema itself guarantees this position holds a flag
                 # answer; the only question is which one.
                 match = closest_enum_match(stripped, pat.YES_NO_NA_VALUES, cutoff=0.6)
+            # "NA" is kept as its own YES_NO_NA_VALUES member (see the
+            # period-stripping comment above) purely so a bare "NA" OCR
+            # token still matches at the 0.85 cutoff - "N.A" alone would
+            # score only 0.80 against it. But that means the CLAIMED value
+            # itself could come back as the bare "NA" spelling instead of
+            # the canonical "N.A" the rest of this system (remark.py,
+            # dump_xml_export.py, the real ground truth itself) always
+            # uses - normalize it here, once, right where the match is
+            # finalized, so every caller only ever sees "N.A".
+            if match == "NA":
+                match = "N.A"
             same_line = prev_line is None or w.line_num == prev_line
             # Confirmed the identical wrapped-run pattern in old-layout
             # November-dump data too (not new-layout-specific after all -

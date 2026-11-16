@@ -30,15 +30,6 @@ def _valid_email(value: str) -> bool:
     return bool(_STRICT_EMAIL.match(value))
 
 
-def _valid_phone(value: str) -> bool:
-    digits = re.sub(r"\D", "", value)
-    # 10 digits, or 11 with a leading US country-code "1" - both appear as
-    # valid in BN_WorkFlow.pdf's own examples ("1234567890" and
-    # "+1 123-456-7890"). The value itself is stored exactly as read from
-    # the image (see _extract_phones) - this only checks the digit count.
-    return len(digits) == 10 or (len(digits) == 11 and digits[0] == "1")
-
-
 def _valid_record_no(value: str) -> bool:
     # BN_Workflow.pdf rule 2 documents 5-6 digits, but real data regularly
     # runs 7-8 (see extraction/patterns.py's RECORD_ID_NUMERIC, already
@@ -49,9 +40,19 @@ def _valid_record_no(value: str) -> bool:
     return value.isdigit() and len(value) in (5, 6, 7, 8)
 
 
+# A period WITHIN a word (e.g. "C.Dreszer", "Jose.Magana", "Dr.Cm") is a
+# real, valid shape in this document family - an initial or title glued to
+# the rest of the name with a period instead of a space - confirmed
+# directly against source images (November dataset, USER 33/5820.jpeg and
+# others). Plain p.isalpha() rejected every one of these as a format error,
+# wrongly naming the field invalid in Remark even though the value itself
+# was read correctly. A trailing period alone ("Dr.") is allowed too.
+_NAME_WORD = re.compile(r"[A-Za-z]+(?:\.[A-Za-z]+)*\.?")
+
+
 def _valid_name(value: str) -> bool:
     parts = value.split()
-    return len(parts) >= 2 and all(p.isalpha() and len(p) >= 2 for p in parts)
+    return len(parts) >= 2 and all(_NAME_WORD.fullmatch(p) and len(p) >= 2 for p in parts)
 
 
 def _valid_two_word_name(value: str) -> bool:
@@ -76,8 +77,13 @@ def _valid_two_word_name(value: str) -> bool:
     # extractions behind an unrelated word-count rule, never caught a
     # real extraction error (the round-7 analysis above is entirely
     # about word COUNT, not character class).
+    # Same real shape as _valid_name above (an initial/title glued on with
+    # a period, e.g. "Jose.Magana") - allowed here too, on top of the
+    # existing digit allowance, rather than flagging it invalid.
     parts = value.split()
-    return len(parts) == 2 and all(re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", p) and len(p) >= 2 for p in parts)
+    return len(parts) == 2 and all(
+        re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z0-9]+)*\.?", p) and len(p) >= 2 for p in parts
+    )
 
 
 def _valid_street_address(value: str) -> bool:
@@ -186,7 +192,14 @@ FIELD_VALIDATORS: dict[str, callable] = {
     "city_1": _valid_city,
     "state_1": _valid_state,
     "zip_1": _valid_zip,
-    "phno_1": _valid_phone,
+    # phno_1/phno_2: deliberately no format validator. The old rule
+    # required exactly 10 digits (or 11 with a leading "1") and flagged
+    # anything else - including a correctly-read, genuinely longer number -
+    # as invalid, wrongly naming PhNo_1/PHNo_2 in Remark for phone numbers
+    # that were read accurately but simply aren't 10/11 digits. Removing
+    # the entry makes validate_field_format return None (not applicable)
+    # instead of False, so phone fields are never format-invalidated by
+    # digit count again.
     "country_1": _valid_country,
     "sex_1": _valid_gender,
     "d_birth": _valid_source_date,
@@ -199,7 +212,6 @@ FIELD_VALIDATORS: dict[str, callable] = {
     "state_2": _valid_state,
     "zip_2": _valid_zip,
     "country_2": _valid_country,
-    "phno_2": _valid_phone,
     "alcoholic": _valid_yes_no_na,
     "smoker": _valid_yes_no_na,
     "past_surg": _valid_yes_no_na,

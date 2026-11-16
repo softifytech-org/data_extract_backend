@@ -38,6 +38,68 @@ from app.models.document import ExtractedField
 from app.services.extraction import patterns as pat
 from app.services.extraction.fields import OCR_FIELD_ORDER
 
+# The label Remark uses to name an invalid field is its own, separate thing
+# from FieldSpec.label (fields.py) - that one drives the UI form's on-screen
+# label and the Excel export header, both of which should stay the nicer,
+# human-readable spacing ("City 1", "Ph No 1"). Remark text instead has to
+# match the legacy system's OWN naming convention, since Remark is meant to
+# reproduce that system's exact output. Derived by directly scanning every
+# real Remarks sentence across all 17 November-dump users' DataM.xml (2,176
+# remarks, 1,952 non-"N.A" naming >=1 field) and majority-voting the exact
+# spelling/casing/punctuation used per field - real data entry is
+# inconsistent (typos, stray spaces), so only fields whose real convention
+# clearly differs from FieldSpec.label are overridden below; every other
+# field's real-data majority already matches FieldSpec.label and is left
+# alone. Two entries look like typos but are in fact the dominant, repeated
+# real spelling (not a one-off mistake) - "Allergiesd" (451 occurrences vs.
+# 7 for "Allergies") and "Alcohlic" (57 vs. 8 for "Alcoholic") - the same
+# kind of baked-in legacy-form quirk this project already preserves
+# elsewhere (e.g. dump_xml_export.py's own "Allergiesd" XML tag).
+REMARK_FIELD_LABELS: dict[str, str] = {
+    "record_no": "Record No",
+    "customer_name": "Customer Name",
+    "email_address": "Email Address",
+    "res_address": "Res Address",
+    "city_1": "City_1",
+    "state_1": "State_1",
+    "zip_1": "Zip_1",
+    "phno_1": "PhNo_1",
+    "country_1": "Country_1",
+    "sex_1": "Sex_1",
+    "d_birth": "D_Birth",
+    "height": "Height",
+    "weight": "Weight",
+    "blood_group": "Blood Group",
+    "billing_name": "Billing Name",
+    "shipper_name": "Shipper Name",
+    "city_2": "City_2",
+    "state_2": "State_2",
+    "zip_2": "Zip_2",
+    "country_2": "Country_2",
+    "phno_2": "PHNo_2",
+    "alcoholic": "Alcohlic",
+    "smoker": "Smoker",
+    "past_surg": "Past Surg",
+    "diabetic": "Diabetic",
+    "allergies": "Allergiesd",
+    "policy_no": "Policy No",
+    "d_b_life_assure": "D_B_Life_Assure",
+    "p_inst": "P_Inst",
+    "name_p_holder": "Name_P_Holder",
+    "stm_name": "STM Name",
+    "stm_code": "STM_Code",
+    "dob": "DOB",
+    "sex_2": "Sex_2",
+    "card_name": "CARD Name",
+    "medicine": "Medicine",
+    "dosage": "Dosage",
+    "tablets": "Tablets",
+    "pill_rate": "Pill Rate",
+    "cost": "Cost",
+    "shipping_cost": "Shipping Cost",
+    "total_amount": "Total Amount",
+}
+
 
 def _is_explicit_na(value: str | None) -> bool:
     if not value:
@@ -61,7 +123,7 @@ def generate_remark(fields: dict[str, ExtractedField]) -> str:
             or (field.value and field.validation.format_valid is False)
             or field.marked_invalid
         ):
-            invalid_labels.append(field.label)
+            invalid_labels.append(REMARK_FIELD_LABELS.get(name, field.label))
 
     if not invalid_labels:
         return "N.A"

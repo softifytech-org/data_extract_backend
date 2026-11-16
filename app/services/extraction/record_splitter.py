@@ -95,7 +95,24 @@ def _find_anchor_words(words: list[OCRWord]) -> list[tuple[str, OCRWord]]:
     for line_words in by_line.values():
         leftmost_ids.add(id(min(line_words, key=lambda w: w.x)))
 
-    alnum_match_count = sum(1 for w in words if pat.RECORD_ID_ANCHOR.search(w.text.strip()))
+    # Real, confirmed bug (November dataset, USER 33/5820.jpeg): this
+    # document's own record-ID shape is the plain 5-digit numeric family
+    # ("70187", "70188", ... each genuinely leftmost on its line), but its
+    # billing contact email, "bill@holtav.com", repeats across several
+    # records and its shape coincidentally satisfies the confusable alnum
+    # RECORD_ID_ANCHOR regex - always mid-line (never leftmost), since an
+    # email is never the first word of a genuine record-start line (see
+    # the schema invariant above: Record No always leads its own line).
+    # That email alone hit the raw ">=2 matches" threshold meant to guard
+    # against a single coincidental match, wrongly setting has_alnum_anchor
+    # and disabling the numeric/prefixed-numeric branches for the WHOLE
+    # page - zero anchors, zero records, exactly the reported symptom.
+    # Counting only leftmost matches closes this gap directly (mid-line
+    # text, by definition, can never be a genuine anchor anyway) without
+    # touching the numeric-family detection logic itself.
+    alnum_match_count = sum(
+        1 for w in words if id(w) in leftmost_ids and pat.RECORD_ID_ANCHOR.search(w.text.strip())
+    )
     has_alnum_anchor = alnum_match_count >= 2
 
     found: list[tuple[str, OCRWord]] = []
